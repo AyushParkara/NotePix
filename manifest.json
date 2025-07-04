@@ -7,5 +7,6 @@
 	"author": "Ayush Parkara",
 	"authorUrl": "https://github.com/AyushParkara",
 	"fundingUrl": "https://www.paypal.com/paypalme/AyushParkara",
+	"main": main.js
 	"isDesktopOnly": false
 }
