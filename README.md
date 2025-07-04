@@ -1,4 +1,4 @@
-# NotePix - GitHub Image Uploader for Obsidian
+# NotePix - GitHub Image Uploader
 
 [![Built for Obsidian](https://img.shields.io/badge/Built%20for-Obsidian-7B68EE.svg?style=for-the-badge)](https://obsidian.md)
 [![Release Version](https://img.shields.io/github/v/release/AyushParkara/NotePix?style=for-the-badge&sort=semver)](https://github.com/AyushParkara/NotePix/releases/)
