@@ -221,7 +221,7 @@ var MyPlugin = class extends import_obsidian.Plugin {
       if (!response.ok) {
         throw new Error(`GitHub API Error: ${(await response.json()).message}`);
       }
-      const publicUrl = `https://cdn.jsdelivr.net/gh/${this.settings.githubUser}/${this.settings.repoName}@${this.settings.branchName}/${filePath}`;
+      const publicUrl = `https://raw.githubusercontent.com/${this.settings.githubUser}/${this.settings.repoName}@${this.settings.branchName}/${filePath}`;
 
       if (isPaste) {
           // If it was a paste, we just insert the new URL at the cursor
