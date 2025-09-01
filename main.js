@@ -1,5 +1,6 @@
 var import_obsidian = require("obsidian");
 
+// crypto.ts
 var PBKDF2_ITERATIONS = 1e5;
 var ALGORITHM = "AES-GCM";
 async function getKey(password, salt) {
@@ -24,18 +25,6 @@ async function getKey(password, salt) {
     ["encrypt", "decrypt"]
   );
 }
-function bufferToBase64(buffer) {
-  return btoa(String.fromCharCode(...new Uint8Array(buffer)));
-}
-function base64ToBuffer(base64) {
-  const binaryString = atob(base64);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return bytes.buffer;
-}
 async function encrypt(plaintext, password) {
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const key = await getKey(password, salt);
@@ -46,16 +35,19 @@ async function encrypt(plaintext, password) {
     key,
     encodedPlaintext
   );
-  return `${bufferToBase64(salt)}:${bufferToBase64(iv)}:${bufferToBase64(encryptedContent)}`;
+  const saltB64 = btoa(String.fromCharCode(...new Uint8Array(salt)));
+  const ivB64 = btoa(String.fromCharCode(...new Uint8Array(iv)));
+  const encryptedB64 = btoa(String.fromCharCode(...new Uint8Array(encryptedContent)));
+  return `${saltB64}:${ivB64}:${encryptedB64}`;
 }
 async function decrypt(encryptedString, password) {
   const [saltB64, ivB64, encryptedB64] = encryptedString.split(":");
   if (!saltB64 || !ivB64 || !encryptedB64) {
     throw new Error("Invalid encrypted data format.");
   }
-  const salt = base64ToBuffer(saltB64);
-  const iv = base64ToBuffer(ivB64);
-  const encryptedContent = base64ToBuffer(encryptedB64);
+  const salt = Uint8Array.from(atob(saltB64), c => c.charCodeAt(0));
+  const iv = Uint8Array.from(atob(ivB64), c => c.charCodeAt(0));
+  const encryptedContent = Uint8Array.from(atob(encryptedB64), c => c.charCodeAt(0));
   const key = await getKey(password, salt);
   const decryptedContent = await crypto.subtle.decrypt(
     { name: ALGORITHM, iv },
@@ -65,6 +57,7 @@ async function decrypt(encryptedString, password) {
   return new TextDecoder().decode(decryptedContent);
 }
 
+// main.ts
 var DEFAULT_SETTINGS = {
   githubUser: "",
   repoName: "",
@@ -353,7 +346,7 @@ var PasswordPrompt = class extends import_obsidian.Modal {
   }
   onOpen() {
     const { contentEl } = this;
-    contentEl.createEl("h2", { text: "Enter Master Password" });
+    contentEl.createEl("h2", { text: "Enter master password" });
     const passwordInput = new import_obsidian.Setting(contentEl).setName("Password").addText((text) => {
       text.inputEl.type = "password";
       text.onChange((value) => {
@@ -391,17 +384,16 @@ var GitHubUploaderSettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "GitHub Image Uploader Settings" });
-    new import_obsidian.Setting(containerEl).setName("GitHub Username").addText((text) => text.setPlaceholder("your-name").setValue(this.plugin.settings.githubUser).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("GitHub username").addText((text) => text.setPlaceholder("your-name").setValue(this.plugin.settings.githubUser).onChange(async (value) => {
       this.plugin.settings.githubUser = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("Repository Name").addText((text) => text.setPlaceholder("obsidian-assets").setValue(this.plugin.settings.repoName).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("Repository name").addText((text) => text.setPlaceholder("obsidian-assets").setValue(this.plugin.settings.repoName).onChange(async (value) => {
       this.plugin.settings.repoName = value;
       await this.plugin.saveSettings();
     }));
     new import_obsidian.Setting(containerEl)
-      .setName("Repository Visibility")
+      .setName("Repository visibility")
       .setDesc("Set this to 'private' if you are using a private repository.")
       .addDropdown(dropdown => dropdown
         .addOption('public', 'Public')
@@ -411,20 +403,20 @@ var GitHubUploaderSettingTab = class extends import_obsidian.PluginSettingTab {
           this.plugin.settings.repoVisibility = value;
           await this.plugin.saveSettings();
         }));
-    new import_obsidian.Setting(containerEl).setName("Branch Name").addText((text) => text.setPlaceholder("main").setValue(this.plugin.settings.branchName).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("Branch name").addText((text) => text.setPlaceholder("main").setValue(this.plugin.settings.branchName).onChange(async (value) => {
       this.plugin.settings.branchName = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("Folder Path in Repository").addText((text) => text.setPlaceholder("assets/").setValue(this.plugin.settings.folderPath).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("Folder path in repository").addText((text) => text.setPlaceholder("assets/").setValue(this.plugin.settings.folderPath).onChange(async (value) => {
       this.plugin.settings.folderPath = value.length > 0 && !value.endsWith("/") ? value + "/" : value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("Delete Local File After Upload").addToggle((toggle) => toggle.setValue(this.plugin.settings.deleteLocal).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("Delete local file after upload").addToggle((toggle) => toggle.setValue(this.plugin.settings.deleteLocal).onChange(async (value) => {
       this.plugin.settings.deleteLocal = value;
       await this.plugin.saveSettings();
     }));
-    containerEl.createEl("h3", { text: "Encryption Settings" });
-    new import_obsidian.Setting(containerEl).setName("Enable Encryption").setDesc("Encrypt your GitHub Token. You will be prompted for a password on startup.").addToggle((toggle) => toggle.setValue(this.plugin.settings.useEncryption).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("Encryption").setHeading();
+    new import_obsidian.Setting(containerEl).setName("Enable encryption").setDesc("Encrypt your GitHub Token. You will be prompted for a password on startup.").addToggle((toggle) => toggle.setValue(this.plugin.settings.useEncryption).onChange(async (value) => {
       this.plugin.settings.useEncryption = value;
       if (!value) {
         this.plugin.settings.encryptedToken = "";
@@ -433,14 +425,14 @@ var GitHubUploaderSettingTab = class extends import_obsidian.PluginSettingTab {
       this.display();
     }));
     if (this.plugin.settings.useEncryption) {
-      new import_obsidian.Setting(containerEl).setName("Master Password").setDesc("Set a password to encrypt your token. This is NOT saved.").addText((text) => {
+      new import_obsidian.Setting(containerEl).setName("Master password").setDesc("Set a password to encrypt your token. This is NOT saved.").addText((text) => {
         text.inputEl.type = "password";
         text.setPlaceholder("Enter password to set/change token");
         text.onChange((value) => {
           this.masterPassword = value;
         });
       });
-      new import_obsidian.Setting(containerEl).setName("GitHub Personal Access Token").setDesc("Enter your PAT here. It will be encrypted on save.").addText((text) => {
+      new import_obsidian.Setting(containerEl).setName("GitHub personal access token").setDesc("Enter your PAT here. It will be encrypted on save.").addText((text) => {
         text.inputEl.type = "password";
         text.setPlaceholder("ghp_... (paste new token here)");
         text.onChange((value) => {
