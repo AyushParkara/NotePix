@@ -439,7 +439,7 @@ var GitHubUploaderSettingTab = class extends import_obsidian.PluginSettingTab {
           this.githubToken = value;
         });
       });
-      new import_obsidian.Setting(containerEl).addButton((button) => button.setButtonText("Save Encrypted Token").setCta().onClick(async () => {
+      new import_obsidian.Setting(containerEl).addButton((button) => button.setButtonText("Save encrypted token").setCta().onClick(async () => {
         if (!this.masterPassword || !this.githubToken) {
           new import_obsidian.Notice("Please provide both a Master Password and a Token.");
           return;
