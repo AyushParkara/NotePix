@@ -1,30 +1,5 @@
-var __defProp = Object.defineProperty;
-var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
-var __getOwnPropNames = Object.getOwnPropertyNames;
-var __hasOwnProp = Object.prototype.hasOwnProperty;
-var __export = (target, all) => {
-  for (var name in all)
-    __defProp(target, name, { get: all[name], enumerable: true });
-};
-var __copyProps = (to, from, except, desc) => {
-  if (from && typeof from === "object" || typeof from === "function") {
-    for (let key of __getOwnPropNames(from))
-      if (!__hasOwnProp.call(to, key) && key !== except)
-        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
-  }
-  return to;
-};
-var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
-
-// main.ts
-var main_exports = {};
-__export(main_exports, {
-  default: () => MyPlugin
-});
-module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
 
-// crypto.ts
 var PBKDF2_ITERATIONS = 1e5;
 var ALGORITHM = "AES-GCM";
 async function getKey(password, salt) {
@@ -90,7 +65,6 @@ async function decrypt(encryptedString, password) {
   return new TextDecoder().decode(decryptedContent);
 }
 
-// main.ts
 var DEFAULT_SETTINGS = {
   githubUser: "",
   repoName: "",
@@ -99,7 +73,8 @@ var DEFAULT_SETTINGS = {
   branchName: "main",
   folderPath: "assets/",
   deleteLocal: false,
-  useEncryption: true
+  useEncryption: true,
+  repoVisibility: 'public' // <-- ADD THIS LINE
 };
 var MyPlugin = class extends import_obsidian.Plugin {
   constructor() {
@@ -111,8 +86,13 @@ var MyPlugin = class extends import_obsidian.Plugin {
     await this.loadSettings();
     this.addSettingTab(new GitHubUploaderSettingTab(this.app, this));
 
-    // --- CHANGE 1: REGISTER THE PASTE HANDLER ---
-    // This now listens for paste events directly in the editor.
+    // Initialize an in-memory cache for private images
+    this.imageCache = new Map();
+
+    // Register the processor that will handle our custom image URLs
+    this.registerMarkdownPostProcessor(this.postProcessImages.bind(this));
+
+    // --- Existing event handlers ---
     this.registerEvent(
       this.app.workspace.on("editor-paste", this.handlePaste.bind(this))
     );
@@ -122,7 +102,6 @@ var MyPlugin = class extends import_obsidian.Plugin {
         if (file instanceof import_obsidian.TFile) {
           const imageExtensions = ["png", "jpg", "jpeg", "gif", "bmp", "svg"];
           if (imageExtensions.includes(file.extension.toLowerCase())) {
-            // This logic is kept for drag-and-drop support
             this.handleImageUpload(file);
           }
         }
@@ -130,6 +109,16 @@ var MyPlugin = class extends import_obsidian.Plugin {
     );
   }
 
+  onunload() {
+    // Clear the decrypted token from memory
+    this.decryptedToken = null;
+
+    // IMPORTANT: Revoke all created blob URLs to prevent memory leaks
+    if (this.imageCache) {
+      this.imageCache.forEach(url => URL.revokeObjectURL(url));
+      this.imageCache.clear();
+    }
+  }
   // --- CHANGE 2: ADDED THE `handlePaste` FUNCTION ---
   // This new function processes clipboard events to find and upload images.
   async handlePaste(evt) {
@@ -141,16 +130,16 @@ var MyPlugin = class extends import_obsidian.Plugin {
       const imageFile = Array.from(files).find(file => file.type.startsWith("image/"));
       if (imageFile) {
         evt.preventDefault(); // Stop Obsidian from handling the paste
-        
+
         // Create a temporary TFile-like object to pass to the uploader
         const tempFile = {
-            name: imageFile.name,
-            path: imageFile.name, // Temporary path
-            extension: imageFile.name.split('.').pop() || 'png',
-            vault: this.app.vault,
-            readBinary: () => imageFile.arrayBuffer()
+          name: imageFile.name,
+          path: imageFile.name, // Temporary path
+          extension: imageFile.name.split('.').pop() || 'png',
+          vault: this.app.vault,
+          readBinary: () => imageFile.arrayBuffer()
         };
-        
+
         // We cast it to TFile to satisfy the handleImageUpload signature.
         // The uploader only needs name, extension, and readBinary.
         await this.handleImageUpload(tempFile, true);
@@ -212,7 +201,6 @@ var MyPlugin = class extends import_obsidian.Plugin {
         method: "PUT",
         headers: {
           "Authorization": `token ${token}`,
-          // Use the decrypted token
           "Content-Type": "application/json"
         },
         body: JSON.stringify(requestBody)
@@ -221,15 +209,23 @@ var MyPlugin = class extends import_obsidian.Plugin {
       if (!response.ok) {
         throw new Error(`GitHub API Error: ${(await response.json()).message}`);
       }
-      const publicUrl = `https://raw.githubusercontent.com/${this.settings.githubUser}/${this.settings.repoName}/${this.settings.branchName}/${filePath}`;
+
+      let finalUrl;
+      // Check the repository visibility setting
+      if (this.settings.repoVisibility === 'private') {
+        // For private repos, create our custom URL for the post-processor to handle.
+        finalUrl = `obsidian://notepix/${filePath}`;
+        new import_obsidian.Notice("Private image link created.");
+      } else {
+        // For public repos, use the standard raw GitHub URL.
+        finalUrl = `https://raw.githubusercontent.com/${this.settings.githubUser}/${this.settings.repoName}/${this.settings.branchName}/${filePath}`;
+      }
 
       if (isPaste) {
-          // If it was a paste, we just insert the new URL at the cursor
-          const activeView = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
-          activeView?.editor.replaceSelection(`![](${publicUrl})`);
+        const activeView = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
+        activeView?.editor.replaceSelection(`![](${finalUrl})`);
       } else {
-          // If it was a file creation, we find and replace the link
-          await this.replaceLinkInEditor(file.name, publicUrl);
+        await this.replaceLinkInEditor(file.name, finalUrl);
       }
 
       new import_obsidian.Notice(`${newFileName} uploaded successfully!`);
@@ -244,6 +240,66 @@ var MyPlugin = class extends import_obsidian.Plugin {
     }
   }
 
+  // In main.js, inside the MyPlugin class (add this new function)
+
+  async postProcessImages(element, context) {
+    const images = element.findAll("img");
+    if (images.length === 0) {
+      return;
+    }
+
+    const token = await this.getDecryptedToken();
+    if (this.settings.useEncryption && !token) {
+      // Can't process images without a token
+      return;
+    }
+
+    for (const img of images) {
+      const src = img.getAttribute("src");
+      if (!src || !src.startsWith("obsidian://notepix/")) {
+        continue;
+      }
+
+      const imagePath = src.substring("obsidian://notepix/".length);
+
+      // 1. Check if the image is already in our cache
+      if (this.imageCache.has(imagePath)) {
+        img.src = this.imageCache.get(imagePath);
+        continue;
+      }
+
+      // 2. If not cached, fetch it from GitHub
+      try {
+        const apiUrl = `https://api.github.com/repos/${this.settings.githubUser}/${this.settings.repoName}/contents/${imagePath}`;
+
+        const response = await fetch(apiUrl, {
+          method: "GET",
+          headers: {
+            "Authorization": `token ${token}`,
+            // Use this header to get the raw file content directly
+            "Accept": 'application/vnd.github.v3.raw',
+          }
+        });
+
+        if (!response.ok) {
+          console.error(`NotePix: Failed to fetch private image ${imagePath}. Status: ${response.status}`);
+          // Optional: set a 'broken image' icon
+          img.src = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJsdWNpZGUgbHVjaWRlLWJhbiI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiLz48bGluZSB4MT0iNC45MyIgeTE9IjQuOTMiIHgyPSIxOS4wNyIgeTI9IjE5LjA3Ii8+PC9zdmc+";
+          continue;
+        }
+
+        const imageBlob = await response.blob();
+        const blobUrl = URL.createObjectURL(imageBlob);
+
+        // 3. Cache the new blob URL and set the image src
+        this.imageCache.set(imagePath, blobUrl);
+        img.src = blobUrl;
+
+      } catch (error) {
+        console.error("NotePix: Error processing private image:", error);
+      }
+    }
+  }
   // --- CHANGE 3: IMPROVED LINK REPLACEMENT FUNCTION ---
   // This now handles both ![[wikilinks]] and ![](markdown_links)
   async replaceLinkInEditor(fileName, newUrl) {
@@ -260,7 +316,7 @@ var MyPlugin = class extends import_obsidian.Plugin {
 
       // Escape special characters for regex
       const escapedFileName = fileName.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&");
-      
+
       // Create regex to find both wikilink and markdown link formats
       const linkRegex = new RegExp(`!\\[\\[${escapedFileName}\\]\\]|!\\[.*?\\]\\(.*?${encodeURIComponent(escapedFileName)}.*?\\)`);
 
@@ -274,10 +330,6 @@ var MyPlugin = class extends import_obsidian.Plugin {
         // Don't show a notice for this, as it can be noisy
       }
     }, 100); // A small delay to ensure Obsidian has written the link to the file
-  }
-
-  onunload() {
-    this.decryptedToken = null;
   }
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -348,6 +400,17 @@ var GitHubUploaderSettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.settings.repoName = value;
       await this.plugin.saveSettings();
     }));
+    new import_obsidian.Setting(containerEl)
+      .setName("Repository Visibility")
+      .setDesc("Set this to 'private' if you are using a private repository.")
+      .addDropdown(dropdown => dropdown
+        .addOption('public', 'Public')
+        .addOption('private', 'Private')
+        .setValue(this.plugin.settings.repoVisibility || 'public')
+        .onChange(async (value) => {
+          this.plugin.settings.repoVisibility = value;
+          await this.plugin.saveSettings();
+        }));
     new import_obsidian.Setting(containerEl).setName("Branch Name").addText((text) => text.setPlaceholder("main").setValue(this.plugin.settings.branchName).onChange(async (value) => {
       this.plugin.settings.branchName = value;
       await this.plugin.saveSettings();
@@ -401,3 +464,4 @@ var GitHubUploaderSettingTab = class extends import_obsidian.PluginSettingTab {
     }
   }
 };
+module.exports = MyPlugin;
