@@ -68,6 +68,3 @@ If your issue requires personalized troubleshooting, privacy concerns (e.g., sha
 3.  A support team member will then create a **private, one-on-one ticket channel** for you to manage your issue individually and confidentially.
 
 Thank you for helping to make NotePix better\!
-
-```
-```
