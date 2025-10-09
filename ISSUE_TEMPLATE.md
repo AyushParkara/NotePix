@@ -10,6 +10,7 @@ Please follow the appropriate template below to ensure we have all the necessary
 ### **1. 🐞 Bug Report Template**
 
 Use this format to report unexpected behavior, errors, or broken functionality.
+
 **▶️ Recommended Issue Title Format:** `[BUG] Brief summary of the problem and where it occurs`
 
 ### 🐞 Bug Report
@@ -37,6 +38,7 @@ Use this format to report unexpected behavior, errors, or broken functionality.
 ### **2. ✨ Feature Request / Suggestion Template**
 
 Use this format to suggest a new feature or an improvement to existing functionality.
+
 **▶️ Recommended Issue Title Format:** `[FEAT] Concise description of the new feature or suggestion`
 
 ### ✨ Feature Request / Suggestion
