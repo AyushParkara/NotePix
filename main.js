@@ -1,4 +1,5 @@
 var import_obsidian = require("obsidian");
+var path = require("path");
 
 // crypto.ts
 var PBKDF2_ITERATIONS = 1e5;
@@ -67,13 +68,16 @@ var DEFAULT_SETTINGS = {
   folderPath: "assets/",
   deleteLocal: false,
   useEncryption: true,
-  repoVisibility: 'public' // <-- ADD THIS LINE
+  repoVisibility: 'public',
+  uploadOnPaste: 'always',
+  localImageFolder: 'notepix-local'
 };
 var MyPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
     // This will hold the decrypted token in memory for the session
     this.decryptedToken = null;
+    this.isPromptingForPassword = false;
   }
   async onload() {
     await this.loadSettings();
@@ -94,9 +98,22 @@ var MyPlugin = class extends import_obsidian.Plugin {
       this.app.vault.on("create", (file) => {
         if (file instanceof import_obsidian.TFile) {
           const imageExtensions = ["png", "jpg", "jpeg", "gif", "bmp", "svg"];
-          if (imageExtensions.includes(file.extension.toLowerCase())) {
-            this.handleImageUpload(file);
+          if (!imageExtensions.includes(file.extension.toLowerCase())) {
+            return;
           }
+
+          // Ignore any file created inside the local-only images folder
+          const filePathNorm = file.path.replace(/\\/g, "/");
+          const folderNorm = (this.settings.localImageFolder || "notepix-local")
+            .replace(/\\/g, "/")
+            .replace(/^\/+|\/+$/g, "");
+
+          if (filePathNorm.startsWith(folderNorm + "/")) {
+            // This is an intentionally local-only image; do not auto-upload
+            return;
+          }
+
+          this.handleImageUpload(file);
         }
       })
     );
@@ -115,37 +132,96 @@ var MyPlugin = class extends import_obsidian.Plugin {
   // --- CHANGE 2: ADDED THE `handlePaste` FUNCTION ---
   // This new function processes clipboard events to find and upload images.
   async handlePaste(evt) {
-    if (evt.clipboardData === null) {
+    const files = evt.clipboardData?.files;
+    if (!files || files.length === 0) {
       return;
     }
-    const files = evt.clipboardData.files;
-    if (files.length > 0) {
-      const imageFile = Array.from(files).find(file => file.type.startsWith("image/"));
-      if (imageFile) {
-        evt.preventDefault(); // Stop Obsidian from handling the paste
+    const imageFile = Array.from(files).find(file => file.type.startsWith("image/"));
+    if (!imageFile) {
+      return;
+    }
 
-        // Create a temporary TFile-like object to pass to the uploader
-        const tempFile = {
-          name: imageFile.name,
-          path: imageFile.name, // Temporary path
-          extension: imageFile.name.split('.').pop() || 'png',
-          vault: this.app.vault,
-          readBinary: () => imageFile.arrayBuffer()
-        };
+    // If uploadOnPaste is 'always', just upload and finish.
+    if (this.settings.uploadOnPaste === 'always') {
+      evt.preventDefault();
+      await this.uploadPastedImage(imageFile);
+      return;
+    }
 
-        // We cast it to TFile to satisfy the handleImageUpload signature.
-        // The uploader only needs name, extension, and readBinary.
-        await this.handleImageUpload(tempFile, true);
+    // If uploadOnPaste is 'ask', we begin the full logic.
+    if (this.settings.uploadOnPaste === 'ask') {
+      evt.preventDefault(); // Take control of the paste event.
+
+      const modal = new ConfirmationModal(this.app, "Upload Image?", "Do you want to upload this image to GitHub?");
+      const confirmed = await modal.open();
+
+      if (confirmed) {
+        // If confirmed, proceed with the upload.
+        await this.uploadPastedImage(imageFile);
+      } else {
+        // If not confirmed, save the image locally.
+        await this.saveImageLocally(imageFile);
       }
     }
+    // If uploadOnPaste is set to something else, do nothing and let Obsidian handle it.
   }
 
-  // New method to get the token, prompting for password if needed.
+  async uploadPastedImage(imageFile) {
+    const tempFile = {
+      name: imageFile.name,
+      path: imageFile.name, // Temporary path
+      extension: imageFile.name.split('.').pop() || 'png',
+      vault: this.app.vault,
+      readBinary: () => imageFile.arrayBuffer()
+    };
+    await this.handleImageUpload(tempFile, true);
+  }
+
+  async saveImageLocally(imageFile) {
+    const arrayBuffer = await imageFile.arrayBuffer();
+    const activeView = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
+    if (!activeView) {
+      new import_obsidian.Notice("Cannot save image: No active editor view.");
+      return;
+    }
+
+    // Normalize folder setting to a clean, vault-relative POSIX path
+    const folderPath = (this.settings.localImageFolder || 'notepix-local')
+      .replace(/\\/g, "/")
+      .replace(/^\/+|\/+$/g, "");
+    // Ensure the folder exists
+    try {
+      await this.app.vault.createFolder(folderPath);
+    } catch (e) {
+      // Folder already exists, which is fine
+    }
+
+    const noteName = activeView.file ? activeView.file.basename : 'Untitled';
+    const extension = imageFile.name.split('.').pop() || 'png';
+
+    let i = 1;
+    let newFilePath;
+    do {
+      newFilePath = `${folderPath}/${noteName}-${i}.${extension}`;
+      i++;
+    } while (await this.app.vault.adapter.exists(newFilePath));
+
+
+    // Create the file in the vault at the determined path.
+    const newFile = await this.app.vault.createBinary(newFilePath, arrayBuffer);
+
+    // Insert the link to the newly created file.
+    activeView.editor.replaceSelection(`![[${newFile.path}]]`);
+  }  // New method to get the token, prompting for password if needed.
   async getDecryptedToken() {
     if (this.decryptedToken) {
       return this.decryptedToken;
     }
+    if (this.isPromptingForPassword) {
+      return null;
+    }
     if (this.settings.useEncryption && this.settings.encryptedToken) {
+      this.isPromptingForPassword = true;
       try {
         const password = await new PasswordPrompt(this.app).open();
         const token = await decrypt(this.settings.encryptedToken, password);
@@ -158,6 +234,8 @@ var MyPlugin = class extends import_obsidian.Plugin {
           new import_obsidian.Notice(`Decryption error: ${e.message}`, 5e3);
         }
         return null;
+      } finally {
+        this.isPromptingForPassword = false;
       }
     }
     return null;
@@ -183,7 +261,7 @@ var MyPlugin = class extends import_obsidian.Plugin {
       const fileData = await (isPaste ? file.readBinary() : this.app.vault.readBinary(file));
 
       const base64Data = btoa(new Uint8Array(fileData).reduce((data, byte) => data + String.fromCharCode(byte), ""));
-      const filePath = this.settings.folderPath + newFileName;
+      const filePath = path.posix.join(this.settings.folderPath, newFileName);
       const apiUrl = `https://api.github.com/repos/${this.settings.githubUser}/${this.settings.repoName}/contents/${filePath}`;
       const requestBody = {
         message: `feat: Add image '${newFileName}' from Obsidian`,
@@ -236,61 +314,67 @@ var MyPlugin = class extends import_obsidian.Plugin {
   // In main.js, inside the MyPlugin class (add this new function)
 
   async postProcessImages(element, context) {
-    const images = element.findAll("img");
-    if (images.length === 0) {
-      return;
-    }
-
-    const token = await this.getDecryptedToken();
-    if (this.settings.useEncryption && !token) {
-      // Can't process images without a token
-      return;
-    }
-
-    for (const img of images) {
-      const src = img.getAttribute("src");
-      if (!src || !src.startsWith("obsidian://notepix/")) {
-        continue;
+    this.isHandlingAction = true;
+    try {
+      const images = element.findAll("img");
+      if (images.length === 0) {
+        return;
       }
 
-      const imagePath = src.substring("obsidian://notepix/".length);
-
-      // 1. Check if the image is already in our cache
-      if (this.imageCache.has(imagePath)) {
-        img.src = this.imageCache.get(imagePath);
-        continue;
+      const token = await this.getDecryptedToken();
+      if (this.settings.useEncryption && !token) {
+        // Can't process images without a token
+        return;
       }
 
-      // 2. If not cached, fetch it from GitHub
-      try {
-        const apiUrl = `https://api.github.com/repos/${this.settings.githubUser}/${this.settings.repoName}/contents/${imagePath}`;
-
-        const response = await fetch(apiUrl, {
-          method: "GET",
-          headers: {
-            "Authorization": `token ${token}`,
-            // Use this header to get the raw file content directly
-            "Accept": 'application/vnd.github.v3.raw',
-          }
-        });
-
-        if (!response.ok) {
-          console.error(`NotePix: Failed to fetch private image ${imagePath}. Status: ${response.status}`);
-          // Optional: set a 'broken image' icon
-          img.src = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJsdWNpZGUgbHVjaWRlLWJhbiI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiLz48bGluZSB4MT0iNC45MyIgeTE9IjQuOTMiIHgyPSIxOS4wNyIgeTI9IjE5LjA3Ii8+PC9zdmc+";
+      for (const img of images) {
+        const src = img.getAttribute("src");
+        if (!src || !src.startsWith("obsidian://notepix/")) {
           continue;
         }
 
-        const imageBlob = await response.blob();
-        const blobUrl = URL.createObjectURL(imageBlob);
+        const imagePath = src.substring("obsidian://notepix/".length);
 
-        // 3. Cache the new blob URL and set the image src
-        this.imageCache.set(imagePath, blobUrl);
-        img.src = blobUrl;
+        const imagePathWithForwardSlashes = imagePath.replace(/\\/g, "/");
+        // 1. Check if the image is already in our cache
+        if (this.imageCache.has(imagePathWithForwardSlashes)) {
+          img.src = this.imageCache.get(imagePathWithForwardSlashes);
+          continue;
+        }
 
-      } catch (error) {
-        console.error("NotePix: Error processing private image:", error);
+        // 2. If not cached, fetch it from GitHub
+        try {
+          const apiUrl = `https://api.github.com/repos/${this.settings.githubUser}/${this.settings.repoName}/contents/${imagePathWithForwardSlashes}`;
+
+          const response = await fetch(apiUrl, {
+            method: "GET",
+            headers: {
+              "Authorization": `token ${token}`,
+              // Use this header to get the raw file content directly
+              "Accept": 'application/vnd.github.v3.raw',
+            }
+          });
+
+          if (!response.ok) {
+            console.error(`NotePix: Failed to fetch private image ${imagePath}. Status: ${response.status}`);
+            // Optional: set a 'broken image' icon
+            img.src = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJsdWNpZGUgbHVjaWRlLWJhbiI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiLz48bGluZSB4MT0iNC45MyIgeTE9IjQuOTMiIHgyPSIxOS4wNyIgeTI9IjE5LjA3Ii8+PC9zdmc+";
+            continue;
+          }
+
+          const imageBlob = await response.blob();
+          const blobUrl = URL.createObjectURL(imageBlob);
+
+          // 3. Cache the new blob URL and set the image src
+          this.imageCache.set(imagePath, blobUrl);
+          img.src = blobUrl;
+
+        } catch (error) {
+          console.error("NotePix: Error processing private image:", error);
+        }
       }
+    } finally {
+      this.isHandlingAction = false;
     }
   }
   // --- CHANGE 3: IMPROVED LINK REPLACEMENT FUNCTION ---
@@ -374,6 +458,48 @@ var PasswordPrompt = class extends import_obsidian.Modal {
     }
   }
 };
+
+var ConfirmationModal = class extends import_obsidian.Modal {
+  constructor(app, title, message) {
+    super(app);
+    this.title = title;
+    this.message = message;
+    this.confirmed = false;
+  }
+
+  open() {
+    return new Promise((resolve) => {
+      this.resolve = resolve;
+      super.open();
+    });
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h2", { text: this.title });
+    contentEl.createEl("p", { text: this.message });
+
+    new import_obsidian.Setting(contentEl)
+      .addButton(btn => btn
+        .setButtonText("Yes")
+        .setCta()
+        .onClick(() => {
+          this.confirmed = true;
+          this.close();
+        }))
+      .addButton(btn => btn
+        .setButtonText("No")
+        .onClick(() => {
+          this.confirmed = false;
+          this.close();
+        }));
+  }
+
+  onClose() {
+    this.resolve(this.confirmed);
+  }
+}
+
 var GitHubUploaderSettingTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -415,6 +541,30 @@ var GitHubUploaderSettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.settings.deleteLocal = value;
       await this.plugin.saveSettings();
     }));
+
+    new import_obsidian.Setting(containerEl)
+      .setName("Pasted image upload behavior")
+      .setDesc("Choose whether to upload pasted images automatically or to be asked each time.")
+      .addDropdown(dropdown => dropdown
+        .addOption('always', 'Always Upload')
+        .addOption('ask', 'Ask Before Uploading')
+        .setValue(this.plugin.settings.uploadOnPaste || 'always')
+        .onChange(async (value) => {
+          this.plugin.settings.uploadOnPaste = value;
+          await this.plugin.saveSettings();
+        }));
+
+    new import_obsidian.Setting(containerEl)
+      .setName("Local image folder")
+      .setDesc("The folder where images will be saved when you choose not to upload them.")
+      .addText(text => text
+        .setPlaceholder("notepix-local")
+        .setValue(this.plugin.settings.localImageFolder)
+        .onChange(async (value) => {
+          this.plugin.settings.localImageFolder = value;
+          await this.plugin.saveSettings();
+        }));
+
     new import_obsidian.Setting(containerEl).setName("Encryption").setHeading();
     new import_obsidian.Setting(containerEl).setName("Enable encryption").setDesc("Encrypt your GitHub Token. You will be prompted for a password on startup.").addToggle((toggle) => toggle.setValue(this.plugin.settings.useEncryption).onChange(async (value) => {
       this.plugin.settings.useEncryption = value;
