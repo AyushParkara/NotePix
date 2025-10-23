@@ -63,14 +63,20 @@ var DEFAULT_SETTINGS = {
   githubUser: "",
   repoName: "",
   encryptedToken: "",
-  // Default is empty
+  plainToken: "",
   branchName: "main",
   folderPath: "assets/",
   deleteLocal: false,
   useEncryption: true,
   repoVisibility: 'public',
   uploadOnPaste: 'always',
-  localImageFolder: 'notepix-local'
+  localImageFolder: 'notepix-local',
+  uploadImageFolder: 'notepix-uploads',
+  autoUpload: true,
+  extraWatchedFolders: '',
+  extraWatchedList: [],
+  localOnlyFolders: '',
+  localOnlyList: []
 };
 var MyPlugin = class extends import_obsidian.Plugin {
   constructor() {
@@ -78,6 +84,22 @@ var MyPlugin = class extends import_obsidian.Plugin {
     // This will hold the decrypted token in memory for the session
     this.decryptedToken = null;
     this.isPromptingForPassword = false;
+  }
+  getVaultFolderPaths() {
+    const res = [];
+    const root = this.app.vault.getRoot();
+    const walk = (folder) => {
+      const p = (folder.path || "").replace(/^\/+|\/+$/g, "");
+      res.push(p);
+      const children = folder.children || [];
+      for (const child of children) {
+        if (child instanceof import_obsidian.TFolder) {
+          walk(child);
+        }
+      }
+    };
+    walk(root);
+    return res;
   }
   async onload() {
     await this.loadSettings();
@@ -89,32 +111,46 @@ var MyPlugin = class extends import_obsidian.Plugin {
     // Register the processor that will handle our custom image URLs
     this.registerMarkdownPostProcessor(this.postProcessImages.bind(this));
 
-    // --- Existing event handlers ---
+    // If uploadOnPaste is 'always', save into upload folder and upload
     this.registerEvent(
       this.app.workspace.on("editor-paste", this.handlePaste.bind(this))
     );
 
     this.registerEvent(
       this.app.vault.on("create", (file) => {
-        if (file instanceof import_obsidian.TFile) {
-          const imageExtensions = ["png", "jpg", "jpeg", "gif", "bmp", "svg"];
-          if (!imageExtensions.includes(file.extension.toLowerCase())) {
-            return;
-          }
+        if (!(file instanceof import_obsidian.TFile)) return;
+        const imageExtensions = ["png", "jpg", "jpeg", "gif", "bmp", "svg"];
+        if (!imageExtensions.includes(file.extension.toLowerCase())) return;
 
-          // Ignore any file created inside the local-only images folder
-          const filePathNorm = file.path.replace(/\\/g, "/");
-          const folderNorm = (this.settings.localImageFolder || "notepix-local")
-            .replace(/\\/g, "/")
-            .replace(/^\/+|\/+$/g, "");
+        const filePathNorm = file.path.replace(/\\/g, "/");
+        const localOnly = (Array.isArray(this.settings.localOnlyList) && this.settings.localOnlyList.length > 0
+          ? this.settings.localOnlyList
+          : (this.settings.localOnlyFolders || this.settings.localImageFolder || 'notepix-local').split(','))
+          .map(s => (typeof s === 'string' ? s : s.path || ''))
+          .map(s => (s || '').trim())
+          .filter(Boolean)
+          .map(s => s.replace(/\\/g, "/").replace(/^\/+|\/+$/g, ""));
+        // Always ignore any local-only folders (explicitly not for upload)
+        if (localOnly.some(ign => filePathNorm === ign || filePathNorm.startsWith(ign + "/"))) return;
 
-          if (filePathNorm.startsWith(folderNorm + "/")) {
-            // This is an intentionally local-only image; do not auto-upload
-            return;
-          }
+        // Only auto-upload if enabled and inside a watched folder
+        if (!this.settings.autoUpload) return;
 
-          this.handleImageUpload(file);
-        }
+        const uploadNorm = (this.settings.uploadImageFolder || 'notepix-uploads')
+          .replace(/\\/g, "/")
+          .replace(/^\/+|\/+$/g, "");
+        const extra = (Array.isArray(this.settings.extraWatchedList) && this.settings.extraWatchedList.length > 0
+          ? this.settings.extraWatchedList.map(e => e?.path || '')
+          : (this.settings.extraWatchedFolders || '').split(','))
+          .map(s => (s || '').trim())
+          .filter(Boolean)
+          .map(s => s.replace(/\\/g, "/").replace(/^\/+|\/+$/g, ""));
+
+        const inUpload = uploadNorm && (filePathNorm === uploadNorm || filePathNorm.startsWith(uploadNorm + "/"));
+        const inExtra = extra.some(f => filePathNorm === f || filePathNorm.startsWith(f + "/"));
+        if (!(inUpload || inExtra)) return;
+
+        this.handleImageUpload(file);
       })
     );
   }
@@ -129,8 +165,6 @@ var MyPlugin = class extends import_obsidian.Plugin {
       this.imageCache.clear();
     }
   }
-  // --- CHANGE 2: ADDED THE `handlePaste` FUNCTION ---
-  // This new function processes clipboard events to find and upload images.
   async handlePaste(evt) {
     const files = evt.clipboardData?.files;
     if (!files || files.length === 0) {
@@ -167,14 +201,43 @@ var MyPlugin = class extends import_obsidian.Plugin {
   }
 
   async uploadPastedImage(imageFile) {
-    const tempFile = {
-      name: imageFile.name,
-      path: imageFile.name, // Temporary path
-      extension: imageFile.name.split('.').pop() || 'png',
-      vault: this.app.vault,
-      readBinary: () => imageFile.arrayBuffer()
-    };
-    await this.handleImageUpload(tempFile, true);
+    // Save the image into the configured upload folder, so watcher logic is consistent
+    const arrayBuffer = await imageFile.arrayBuffer();
+    const activeView = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
+    if (!activeView) {
+      new import_obsidian.Notice("Cannot process image: No active editor view.");
+      return;
+    }
+
+    const uploadFolder = (this.settings.uploadImageFolder || 'notepix-uploads')
+      .replace(/\\/g, "/")
+      .replace(/^\/+|\/+$/g, "");
+    try {
+      if (uploadFolder) {
+        await this.app.vault.createFolder(uploadFolder);
+      }
+    } catch { }
+
+    const noteName = activeView.file ? activeView.file.basename : 'Untitled';
+    const extension = imageFile.name.split('.').pop() || 'png';
+    let i = 1;
+    let newFilePath;
+    do {
+      newFilePath = uploadFolder
+        ? `${uploadFolder}/${noteName}-${i}.${extension}`
+        : `${noteName}-${i}.${extension}`;
+      i++;
+    } while (await this.app.vault.adapter.exists(newFilePath));
+
+    const newFile = await this.app.vault.createBinary(newFilePath, arrayBuffer);
+
+    // Insert a temporary wikilink to the local file so the eventual upload can replace it with the final URL
+    activeView.editor.replaceSelection(`![[${newFile.name}]]`);
+
+    // If autoUpload is disabled, upload directly; else watcher will trigger and replace the link
+    if (!this.settings.autoUpload) {
+      await this.handleImageUpload(newFile);
+    }
   }
 
   async saveImageLocally(imageFile) {
@@ -185,8 +248,12 @@ var MyPlugin = class extends import_obsidian.Plugin {
       return;
     }
 
-    // Normalize folder setting to a clean, vault-relative POSIX path
-    const folderPath = (this.settings.localImageFolder || 'notepix-local')
+    // Determine destination local-only folder (first of list or legacy field)
+    const localOnlyFirst = (Array.isArray(this.settings.localOnlyList) && this.settings.localOnlyList.length > 0)
+      ? (this.settings.localOnlyList[0]?.path || this.settings.localOnlyList[0] || '')
+      : (this.settings.localImageFolder || 'notepix-local');
+    // Normalize to a clean, vault-relative POSIX path
+    const folderPath = (localOnlyFirst || 'notepix-local')
       .replace(/\\/g, "/")
       .replace(/^\/+|\/+$/g, "");
     // Ensure the folder exists
@@ -212,7 +279,7 @@ var MyPlugin = class extends import_obsidian.Plugin {
 
     // Insert the link to the newly created file.
     activeView.editor.replaceSelection(`![[${newFile.path}]]`);
-  }  // New method to get the token, prompting for password if needed.
+  }  // New method to get the token, prompting for password if needed (encrypted mode).
   async getDecryptedToken() {
     if (this.decryptedToken) {
       return this.decryptedToken;
@@ -241,19 +308,39 @@ var MyPlugin = class extends import_obsidian.Plugin {
     return null;
   }
 
+  // Unified token getter: returns a usable GitHub token based on settings/state.
+  // - If a decrypted token is already cached in memory, returns it.
+  // - If useEncryption is true, prompts (once) to decrypt encryptedToken when first needed.
+  // - If useEncryption is false, returns the plainToken from settings (no prompts).
+  async getToken() {
+    // In-memory cache takes precedence
+    if (this.decryptedToken) return this.decryptedToken;
+
+    // Encrypted mode
+    if (this.settings.useEncryption) {
+      if (!this.settings.encryptedToken) {
+        new import_obsidian.Notice("No encrypted token found. Please save an encrypted token in NotePix settings.");
+        return null;
+      }
+      const token = await this.getDecryptedToken();
+      return token;
+    }
+
+    // Plain mode
+    if (this.settings.plainToken && this.settings.plainToken.trim().length > 0) {
+      return this.settings.plainToken.trim();
+    }
+    new import_obsidian.Notice("No token found. Please provide a GitHub token in NotePix settings.");
+    return null;
+  }
+
   async handleImageUpload(file, isPaste = false) {
     if (!this.settings.githubUser || !this.settings.repoName) {
       new import_obsidian.Notice("GitHub User and Repo Name must be configured.");
       return;
     }
-    if (this.settings.useEncryption && !this.settings.encryptedToken) {
-      new import_obsidian.Notice("Encryption is enabled, but no token is saved. Please set it in settings.");
-      return;
-    }
-    const token = await this.getDecryptedToken();
-    if (this.settings.useEncryption && !token) {
-      return;
-    }
+    const token = await this.getToken();
+    if (!token) return;
     const uploadNotice = new import_obsidian.Notice(`Uploading ${file.name} to GitHub...`, 0);
     try {
       const timestamp = new Date().toISOString().replace(/[-:.]/g, "");
@@ -311,74 +398,111 @@ var MyPlugin = class extends import_obsidian.Plugin {
     }
   }
 
-  // In main.js, inside the MyPlugin class (add this new function)
-
   async postProcessImages(element, context) {
     this.isHandlingAction = true;
     try {
-      const images = element.findAll("img");
+      const images = Array.from(element.querySelectorAll("img"));
       if (images.length === 0) {
         return;
       }
 
-      const token = await this.getDecryptedToken();
-      if (this.settings.useEncryption && !token) {
-        // Can't process images without a token
+      // Only process images that are NotePix private links
+      const notepixImages = images.filter((img) => {
+        const src = img.getAttribute("src");
+        return src && src.startsWith("obsidian://notepix/");
+      });
+      if (notepixImages.length === 0) {
         return;
       }
 
-      for (const img of images) {
-        const src = img.getAttribute("src");
-        if (!src || !src.startsWith("obsidian://notepix/")) {
-          continue;
+      const hoverPopover = (this.app && this.app.renderContext) ? this.app.renderContext.hoverPopover : null;
+      const isPopoverByAPI = !!hoverPopover;
+
+      const activeLeaf = this.app.workspace.activeLeaf;
+      const isInActiveLeaf = activeLeaf && context.containerEl &&
+        activeLeaf.containerEl.contains(context.containerEl);
+
+      const isHover = isPopoverByAPI || !isInActiveLeaf;
+
+      let token;
+      if (isHover) {
+        if (this.settings.useEncryption) {
+          token = this.decryptedToken;
+        } else {
+          token = (this.settings.plainToken || '').trim() || null;
         }
-
-        const imagePath = src.substring("obsidian://notepix/".length);
-
-        const imagePathWithForwardSlashes = imagePath.replace(/\\/g, "/");
-        // 1. Check if the image is already in our cache
-        if (this.imageCache.has(imagePathWithForwardSlashes)) {
-          img.src = this.imageCache.get(imagePathWithForwardSlashes);
-          continue;
-        }
-
-        // 2. If not cached, fetch it from GitHub
-        try {
-          const apiUrl = `https://api.github.com/repos/${this.settings.githubUser}/${this.settings.repoName}/contents/${imagePathWithForwardSlashes}`;
-
-          const response = await fetch(apiUrl, {
-            method: "GET",
-            headers: {
-              "Authorization": `token ${token}`,
-              // Use this header to get the raw file content directly
-              "Accept": 'application/vnd.github.v3.raw',
-            }
-          });
-
-          if (!response.ok) {
-            console.error(`NotePix: Failed to fetch private image ${imagePath}. Status: ${response.status}`);
-            // Optional: set a 'broken image' icon
-            img.src = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJsdWNpZGUgbHVjaWRlLWJhbiI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiLz48bGluZSB4MT0iNC45MyIgeTE9IjQuOTMiIHgyPSIxOS4wNyIgeTI9IjE5LjA3Ii8+PC9zdmc+";
-            continue;
-          }
-
-          const imageBlob = await response.blob();
-          const blobUrl = URL.createObjectURL(imageBlob);
-
-          // 3. Cache the new blob URL and set the image src
-          this.imageCache.set(imagePath, blobUrl);
-          img.src = blobUrl;
-
-        } catch (error) {
-          console.error("NotePix: Error processing private image:", error);
-        }
+        if (!token) return;
+      } else {
+        token = await this.getToken();
+        if (!token) return; // User declined or missing token
       }
+
+      const encSeg = (p) => p.split('/').map(encodeURIComponent).join('/');
+      const ref = encodeURIComponent(this.settings.branchName || 'main');
+
+      const fetchAndSet = async (img) => {
+        const src = img.getAttribute("src");
+        if (!src) return;
+        const imagePath = src.substring("obsidian://notepix/".length);
+        const norm = imagePath.replace(/\\/g, "/");
+        if (this.imageCache.has(norm)) {
+          img.src = this.imageCache.get(norm);
+          return;
+        }
+        try {
+          const apiUrl = `https://api.github.com/repos/${this.settings.githubUser}/${this.settings.repoName}/contents/${encSeg(norm)}?ref=${ref}`;
+          let response = await fetch(apiUrl, {
+            method: "GET",
+            headers: { "Authorization": `token ${token}`, "Accept": 'application/vnd.github.v3.raw' }
+          });
+          let imageBlob;
+          if (response.ok) {
+            imageBlob = await response.blob();
+          } else {
+            response = await fetch(apiUrl, {
+              method: "GET",
+              headers: { "Authorization": `token ${token}`, "Accept": 'application/vnd.github.v3+json' }
+            });
+            if (!response.ok) {
+              console.error(`NotePix: Failed to fetch private image ${norm}. Status: ${response.status}`);
+              img.src = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJsdWNpZGUgbHVjaWRlLWJhbiI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiLz48bGluZSB4MT0iNC45MyIgeTE9IjQuOTMiIHgyPSIxOS4wNyIgeTI9IjE5LjA3Ii8+PC9zdmc+";
+              return;
+            }
+            const meta = await response.json();
+            if (!meta || !meta.content) return;
+            const raw = atob(meta.content.replace(/\n/g, ''));
+            const bytes = new Uint8Array(raw.length);
+            for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+            imageBlob = new Blob([bytes.buffer]);
+          }
+          const blobUrl = URL.createObjectURL(imageBlob);
+          this.imageCache.set(norm, blobUrl);
+          img.src = blobUrl;
+        } catch (e) {
+          console.error('NotePix: Error processing private image:', e);
+        }
+      };
+
+      // Process current images in parallel
+      await Promise.allSettled(notepixImages.map(img => fetchAndSet(img)));
+
+      // Briefly observe DOM for late-added images and process them
+      const observer = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          for (const node of Array.from(m.addedNodes)) {
+            if (node.nodeType !== 1) continue;
+            const el = node;
+            const imgs = (el.matches && el.matches('img') ? [el] : Array.from(el.querySelectorAll ? el.querySelectorAll('img') : []));
+            imgs.filter(i => i.getAttribute('src')?.startsWith('obsidian://notepix/')).forEach(i => { fetchAndSet(i); });
+          }
+        }
+      });
+      observer.observe(element, { childList: true, subtree: true });
+      setTimeout(() => observer.disconnect(), 1500);
     } finally {
       this.isHandlingAction = false;
     }
   }
-  // --- CHANGE 3: IMPROVED LINK REPLACEMENT FUNCTION ---
-  // This now handles both ![[wikilinks]] and ![](markdown_links)
   async replaceLinkInEditor(fileName, newUrl) {
     setTimeout(() => {
       const activeView = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
@@ -500,12 +624,70 @@ var ConfirmationModal = class extends import_obsidian.Modal {
   }
 }
 
+// Simple modal to pick a folder from the vault
+var SimpleFolderPickerModal = class extends import_obsidian.Modal {
+  constructor(app, folderPaths, onPick) {
+    super(app);
+    this.folderPaths = folderPaths;
+    this.onPick = onPick;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl('h3', { text: 'Choose a folder' });
+    const list = contentEl.createEl('div', { cls: 'notepix-folder-picker' });
+    const makeButton = (label, val) => {
+      const btn = list.createEl('button', { text: label, cls: 'mod-cta' });
+      btn.style.display = 'block';
+      btn.style.marginBottom = '6px';
+      btn.onclick = () => {
+        this.onPick?.(val);
+        this.close();
+      };
+    };
+    // Root folder entry
+    makeButton('/', '');
+    // Other folders
+    (this.folderPaths || [])
+      .filter(p => p.length > 0)
+      .sort((a, b) => a.localeCompare(b))
+      .forEach(p => makeButton(`/${p}`, p));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+
+// Searchable vault folder picker using FuzzySuggestModal
+var VaultFolderSuggestModal = class extends import_obsidian.FuzzySuggestModal {
+  constructor(app, folderPaths, onPick) {
+    super(app);
+    this.folderPaths = (folderPaths || []).map(p => (p || '').replace(/\\/g, "/").replace(/^\/+|\/+$/g, ""));
+    this.onPick = onPick;
+  }
+  getItems() {
+    // Include root as empty string to show '/'
+    const uniq = new Set(['', ...this.folderPaths]);
+    return Array.from(uniq.values());
+  }
+  getItemText(item) {
+    return item === '' ? '/' : `/${item}`;
+  }
+  onChooseItem(item, evt) {
+    this.onPick?.(item);
+  }
+};
+
 var GitHubUploaderSettingTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.masterPassword = "";
     this.githubToken = "";
     this.plugin = plugin;
+    // UI state: reveal extra folders input only when requested or already set
+    this.showExtraFolders = (this.plugin.settings.extraWatchedFolders || "").trim().length > 0;
+    // Track last valid upload folder for inline validation
+    this.lastValidUploadFolder = this.plugin.settings.uploadImageFolder || 'notepix-uploads';
   }
   display() {
     const { containerEl } = this;
@@ -554,9 +736,9 @@ var GitHubUploaderSettingTab = class extends import_obsidian.PluginSettingTab {
           await this.plugin.saveSettings();
         }));
 
-    new import_obsidian.Setting(containerEl)
+    const localPrimarySetting = new import_obsidian.Setting(containerEl)
       .setName("Local image folder")
-      .setDesc("The folder where images will be saved when you choose not to upload them.")
+      .setDesc("The primary folder where images will be saved when you choose not to upload them.")
       .addText(text => text
         .setPlaceholder("notepix-local")
         .setValue(this.plugin.settings.localImageFolder)
@@ -564,17 +746,423 @@ var GitHubUploaderSettingTab = class extends import_obsidian.PluginSettingTab {
           this.plugin.settings.localImageFolder = value;
           await this.plugin.saveSettings();
         }));
+    localPrimarySetting.addExtraButton((btn) => {
+      btn.setIcon?.("folder-open");
+      if (!btn.setIcon) btn.setButtonText("Browse");
+      btn.setTooltip?.("Choose folder from vault");
+      btn.onClick(() => {
+        const folders = this.plugin.getVaultFolderPaths();
+        const modal = new VaultFolderSuggestModal(this.app, folders, async (picked) => {
+          this.plugin.settings.localImageFolder = picked || '';
+          await this.plugin.saveSettings();
+          this.display();
+        });
+        modal.open();
+      });
+    });
+    // Plus button to reveal local-only rows, matching the Upload section UX
+    localPrimarySetting.addExtraButton((btn) => {
+      btn.setIcon?.("plus");
+      if (!btn.setIcon) btn.setButtonText("+");
+      btn.setTooltip?.("Add more local-only folders");
+      btn.onClick(() => {
+        const section = containerEl.querySelector('.notepix-localonly-folders');
+        if (!section) renderLocalOnlyRows();
+      });
+    });
+
+    // Anchor where local-only section will render on demand (hidden until plus is clicked)
+    const localOnlyAnchor = containerEl.createDiv({ cls: 'notepix-localonly-anchor' });
+
+    const renderLocalOnlyRows = () => {
+      const existing = localOnlyAnchor.querySelector('.notepix-localonly-folders');
+      if (existing) existing.remove();
+      const section = localOnlyAnchor.createDiv({ cls: 'notepix-localonly-folders' });
+      section.createEl('h4', { text: 'Additional local-only folders' });
+
+      // Seed model from structured or CSV fallback
+      const fromCSV = (v) => (v || '').split(',').map(s => s.trim()).filter(Boolean).map(p => ({ path: p, label: '' }));
+      let locals = Array.isArray(this.plugin.settings.localOnlyList) && this.plugin.settings.localOnlyList.length > 0
+        ? this.plugin.settings.localOnlyList.map(e => ({ path: e.path || '', label: e.label || '' }))
+        : fromCSV(this.plugin.settings.localOnlyFolders);
+
+      const allFolders = this.plugin.getVaultFolderPaths();
+      const isValidPath = (p) => allFolders.includes(p) || p === '';
+
+      const save = async () => {
+        // Enforce mutual exclusivity for non-empty paths only; keep empty rows so +Add works
+        const uploadNorm = (this.plugin.settings.uploadImageFolder || 'notepix-uploads').replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+        const extra = (Array.isArray(this.plugin.settings.extraWatchedList) && this.plugin.settings.extraWatchedList.length > 0
+          ? this.plugin.settings.extraWatchedList.map(e => e?.path || '')
+          : (this.plugin.settings.extraWatchedFolders || '').split(','))
+          .map(s => (s || '').trim()).filter(Boolean)
+          .map(s => s.replace(/\\/g, "/").replace(/^\/+|\/+$/g, ""));
+        locals = locals.filter(f => {
+          const raw = f.path || '';
+          if (!raw.trim()) return true; // keep empty rows
+          const p = raw.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+          return p !== uploadNorm && !extra.includes(p);
+        });
+        // Persist structured and CSV fallbacks
+        this.plugin.settings.localOnlyList = locals;
+        this.plugin.settings.localOnlyFolders = locals.map(f => f.path).filter(Boolean).join(', ');
+        await this.plugin.saveSettings();
+      };
+
+      locals.forEach((item, idx) => {
+        const row = new import_obsidian.Setting(section).setName(`Local-only ${idx + 1}`);
+        // Path input with validation
+        row.addText(t => {
+          t.setPlaceholder('path/to/folder')
+            .setValue(item.path)
+            .onChange(async (val) => {
+              item.path = val.trim();
+              await save();
+              const valid = isValidPath(item.path);
+              t.inputEl.style.borderColor = valid || item.path.length === 0 ? '' : 'var(--color-red)';
+            });
+        });
+        // Browse
+        row.addExtraButton(btn => {
+          btn.setIcon?.('folder-open');
+          if (!btn.setIcon) btn.setButtonText('Browse');
+          btn.setTooltip?.('Choose folder from vault');
+          btn.onClick(() => {
+            const modal = new VaultFolderSuggestModal(this.app, allFolders, async (picked) => {
+              item.path = picked || '';
+              await save();
+              renderLocalOnlyRows();
+            });
+            modal.open();
+          });
+        });
+        // Label
+        row.addText(t => {
+          t.setPlaceholder('Optional label (e.g., Local screenshots)')
+            .setValue(item.label || '')
+            .onChange(async (val) => {
+              item.label = val;
+              await save();
+            });
+        });
+        // Reorder up/down
+        row.addExtraButton(btn => {
+          btn.setIcon?.('arrow-up');
+          if (!btn.setIcon) btn.setButtonText('Up');
+          btn.setTooltip?.('Move up');
+          btn.onClick(async () => {
+            if (idx > 0) {
+              const tmp = locals[idx - 1];
+              locals[idx - 1] = locals[idx];
+              locals[idx] = tmp;
+              await save();
+              renderLocalOnlyRows();
+            }
+          });
+        });
+        row.addExtraButton(btn => {
+          btn.setIcon?.('arrow-down');
+          if (!btn.setIcon) btn.setButtonText('Down');
+          btn.setTooltip?.('Move down');
+          btn.onClick(async () => {
+            if (idx < locals.length - 1) {
+              const tmp = locals[idx + 1];
+              locals[idx + 1] = locals[idx];
+              locals[idx] = tmp;
+              await save();
+              renderLocalOnlyRows();
+            }
+          });
+        });
+        // Remove
+        row.addExtraButton(btn => {
+          btn.setIcon?.('trash');
+          if (!btn.setIcon) btn.setButtonText('Remove');
+          btn.setTooltip?.('Remove this folder');
+          btn.onClick(async () => {
+            locals.splice(idx, 1);
+            await save();
+            renderLocalOnlyRows();
+          });
+        });
+      });
+
+      // Add row button
+      const addRow = new import_obsidian.Setting(section).setName('Add local-only folder');
+      addRow.addButton(b => b.setButtonText('+ Add').setCta().onClick(async () => {
+        locals.push({ path: '', label: '' });
+        await save();
+        renderLocalOnlyRows();
+      }));
+    };
+
+    // Auto-render local-only rows if settings already contain values
+    if ((this.plugin.settings.localOnlyFolders || '').trim().length > 0 || (this.plugin.settings.localOnlyList || []).length > 0) {
+      renderLocalOnlyRows();
+    }
+
+    const uploadSetting = new import_obsidian.Setting(containerEl)
+      .setName("Upload image folder")
+      .setDesc("Default folder where NotePix saves images that will be uploaded.");
+    uploadSetting.addText(text => {
+      text
+        .setPlaceholder("notepix-uploads")
+        .setValue(this.plugin.settings.uploadImageFolder || 'notepix-uploads')
+        .onChange(async (value) => {
+          const val = (value || '').replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").trim();
+          // Build local-only list (structured or CSV or legacy)
+          const localOnly = (Array.isArray(this.plugin.settings.localOnlyList) && this.plugin.settings.localOnlyList.length > 0
+            ? this.plugin.settings.localOnlyList.map(e => e?.path || '')
+            : (this.plugin.settings.localOnlyFolders || this.plugin.settings.localImageFolder || 'notepix-local').split(','))
+            .map(s => (s || '').trim())
+            .filter(Boolean)
+            .map(s => s.replace(/\\/g, "/").replace(/^\/+|\/+$/g, ""));
+
+          const conflicts = val.length > 0 && localOnly.includes(val);
+          if (conflicts) {
+            // Visual warning and revert to last valid value
+            text.inputEl.style.borderColor = 'var(--color-red)';
+            new import_obsidian.Notice("Upload folder cannot be one of the local-only folders.");
+            setTimeout(() => {
+              text.setValue(this.lastValidUploadFolder || 'notepix-uploads');
+              text.inputEl.style.borderColor = '';
+            }, 0);
+            return;
+          }
+
+          text.inputEl.style.borderColor = '';
+          this.plugin.settings.uploadImageFolder = val;
+          this.lastValidUploadFolder = val;
+          await this.plugin.saveSettings();
+        });
+    });
+    uploadSetting.addExtraButton((btn) => {
+      btn.setIcon?.("folder-open");
+      if (!btn.setIcon) btn.setButtonText("Browse");
+      btn.setTooltip?.("Choose folder from vault");
+      btn.onClick(() => {
+        const folders = this.plugin.getVaultFolderPaths();
+        const modal = new VaultFolderSuggestModal(this.app, folders, (picked) => {
+          const val = (picked || '').replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+          // Conflict check against local-only
+          const localOnly = (Array.isArray(this.plugin.settings.localOnlyList) && this.plugin.settings.localOnlyList.length > 0
+            ? this.plugin.settings.localOnlyList.map(e => e?.path || '')
+            : (this.plugin.settings.localOnlyFolders || this.plugin.settings.localImageFolder || 'notepix-local').split(','))
+            .map(s => (s || '').trim())
+            .filter(Boolean)
+            .map(s => s.replace(/\\/g, "/").replace(/^\/+|\/+$/g, ""));
+          if (val && localOnly.includes(val)) {
+            new import_obsidian.Notice("Upload folder cannot be one of the local-only folders.");
+            return;
+          }
+          this.plugin.settings.uploadImageFolder = val;
+          this.lastValidUploadFolder = val;
+          this.plugin.saveSettings();
+          this.display();
+        });
+        modal.open();
+      });
+    });
+
+    // Create anchor right below the upload section so extra folders render under the plus button
+    const extraAnchor = containerEl.createDiv({ cls: 'notepix-extra-anchor' });
+    uploadSetting.addExtraButton((btn) => {
+      btn.setIcon?.("plus");
+      btn.setTooltip?.("Add more folders to watch");
+      // Fallback text if setIcon is not available
+      if (!btn.setIcon) btn.setButtonText("+");
+      btn.onClick(() => {
+        this.showExtraFolders = true;
+        this.display();
+      });
+    });
+
+    // Removed: Auto-upload toggle to reduce confusion
+
+    if (this.showExtraFolders || (this.plugin.settings.extraWatchedFolders || "").trim().length > 0 || (this.plugin.settings.extraWatchedList || []).length > 0) {
+      extraAnchor.createEl('h4', { text: 'Additional watched folders' });
+
+      // Seed folders model from structured list or CSV fallback
+      const fromCSV = (v) => (v || '').split(',').map(s => s.trim()).filter(Boolean).map(p => ({ path: p, label: '' }));
+      let folders = Array.isArray(this.plugin.settings.extraWatchedList) && this.plugin.settings.extraWatchedList.length > 0
+        ? this.plugin.settings.extraWatchedList.map(e => ({ path: e.path || '', label: e.label || '' }))
+        : fromCSV(this.plugin.settings.extraWatchedFolders);
+
+      const allFolders = this.plugin.getVaultFolderPaths();
+      const isValidPath = (p) => allFolders.includes(p) || p === '';
+
+      const save = async () => {
+        // Filter out exact duplicates (keep first occurrences) and persist
+        const seen = new Set();
+        const deduped = [];
+        for (const f of folders) {
+          const p = (f.path || '').replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+          if (!p) continue; // keep empty rows out of persisted list
+          if (seen.has(p)) continue;
+          seen.add(p);
+          deduped.push({ path: p, label: f.label || '' });
+        }
+        this.plugin.settings.extraWatchedList = deduped;
+        this.plugin.settings.extraWatchedFolders = deduped.map(f => f.path).join(', ');
+        await this.plugin.saveSettings();
+      };
+
+      const renderRows = () => {
+        const existing = extraAnchor.querySelector('.notepix-extra-folders');
+        if (existing) existing.remove();
+        const section = extraAnchor.createDiv({ cls: 'notepix-extra-folders' });
+
+        folders.forEach((item, idx) => {
+          const row = new import_obsidian.Setting(section).setName(`Folder ${idx + 1}`);
+
+          // Path input with validation
+          row.addText(t => {
+            t.setPlaceholder('path/to/folder')
+              .setValue(item.path)
+              .onChange(async (val) => {
+                item.path = val.trim();
+                // Build conflict sets
+                const uploadNorm = (this.plugin.settings.uploadImageFolder || 'notepix-uploads').replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+                const localOnly = (Array.isArray(this.plugin.settings.localOnlyList) && this.plugin.settings.localOnlyList.length > 0
+                  ? this.plugin.settings.localOnlyList.map(e => e?.path || '')
+                  : (this.plugin.settings.localOnlyFolders || this.plugin.settings.localImageFolder || 'notepix-local').split(','))
+                  .map(s => (s || '').trim())
+                  .filter(Boolean)
+                  .map(s => s.replace(/\\/g, "/").replace(/^\/+|\/+$/g, ""));
+                const valNorm = (item.path || '').replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+                const duplicate = folders.some((f, j) => j !== idx && (f.path || '').replace(/\\/g, "/").replace(/^\/+|\/+$/g, "") === valNorm);
+                const conflicts = valNorm && (valNorm === uploadNorm || localOnly.includes(valNorm) || duplicate);
+                await save();
+                // visual validation: red if invalid path or conflicts
+                const valid = isValidPath(item.path) && !conflicts;
+                t.inputEl.style.borderColor = valid || item.path.length === 0 ? '' : 'var(--color-red)';
+                if (!valid && item.path.length > 0) {
+                  new import_obsidian.Notice(duplicate ? 'This folder is already listed.' : 'Folder conflicts with upload or local-only folders.');
+                }
+              });
+          });
+
+          // Browse button
+          row.addExtraButton(btn => {
+            btn.setIcon?.('folder-open');
+            if (!btn.setIcon) btn.setButtonText('Browse');
+            btn.setTooltip?.('Choose folder from vault');
+            btn.onClick(() => {
+              const modal = new VaultFolderSuggestModal(this.app, allFolders, async (picked) => {
+                const uploadNorm = (this.plugin.settings.uploadImageFolder || 'notepix-uploads').replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+                const localOnly = (Array.isArray(this.plugin.settings.localOnlyList) && this.plugin.settings.localOnlyList.length > 0
+                  ? this.plugin.settings.localOnlyList.map(e => e?.path || '')
+                  : (this.plugin.settings.localOnlyFolders || this.plugin.settings.localImageFolder || 'notepix-local').split(','))
+                  .map(s => (s || '').trim())
+                  .filter(Boolean)
+                  .map(s => s.replace(/\\/g, "/").replace(/^\/+|\/+$/g, ""));
+                const pickedNorm = (picked || '').replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+                const duplicate = folders.some((f, j) => j !== idx && (f.path || '').replace(/\\/g, "/").replace(/^\/+|\/+$/g, "") === pickedNorm);
+                if (pickedNorm && (pickedNorm === uploadNorm || localOnly.includes(pickedNorm))) {
+                  new import_obsidian.Notice('Cannot watch this folder: conflicts with upload/local-only.');
+                  return;
+                }
+                if (duplicate) {
+                  new import_obsidian.Notice('This folder is already listed.');
+                  return;
+                }
+                item.path = pickedNorm;
+                await save();
+                renderRows();
+              });
+              modal.open();
+            });
+          });
+
+          // Label input
+          row.addText(t => {
+            t.setPlaceholder('Optional label (e.g., Screenshots)')
+              .setValue(item.label || '')
+              .onChange(async (val) => {
+                item.label = val;
+                await save();
+              });
+          });
+
+          // Reorder up/down
+          row.addExtraButton(btn => {
+            btn.setIcon?.('arrow-up');
+            if (!btn.setIcon) btn.setButtonText('Up');
+            btn.setTooltip?.('Move up');
+            btn.onClick(async () => {
+              if (idx > 0) {
+                const tmp = folders[idx - 1];
+                folders[idx - 1] = folders[idx];
+                folders[idx] = tmp;
+                await save();
+                renderRows();
+              }
+            });
+          });
+          row.addExtraButton(btn => {
+            btn.setIcon?.('arrow-down');
+            if (!btn.setIcon) btn.setButtonText('Down');
+            btn.setTooltip?.('Move down');
+            btn.onClick(async () => {
+              if (idx < folders.length - 1) {
+                const tmp = folders[idx + 1];
+                folders[idx + 1] = folders[idx];
+                folders[idx] = tmp;
+                await save();
+                renderRows();
+              }
+            });
+          });
+
+          // Remove row
+          row.addExtraButton(btn => {
+            btn.setIcon?.('trash');
+            if (!btn.setIcon) btn.setButtonText('Remove');
+            btn.setTooltip?.('Remove this folder');
+            btn.onClick(async () => {
+              folders.splice(idx, 1);
+              await save();
+              renderRows();
+            });
+          });
+        });
+
+        // Add row button
+        const addRow = new import_obsidian.Setting(section).setName('Add folder');
+        addRow.addButton(b => b.setButtonText('+ Add').setCta().onClick(async () => {
+          folders.push({ path: '', label: '' });
+          await save();
+          renderRows();
+        }));
+      };
+
+      renderRows();
+    }
 
     new import_obsidian.Setting(containerEl).setName("Encryption").setHeading();
-    new import_obsidian.Setting(containerEl).setName("Enable encryption").setDesc("Encrypt your GitHub Token. You will be prompted for a password on startup.").addToggle((toggle) => toggle.setValue(this.plugin.settings.useEncryption).onChange(async (value) => {
-      this.plugin.settings.useEncryption = value;
-      if (!value) {
-        this.plugin.settings.encryptedToken = "";
-      }
-      await this.plugin.saveSettings();
-      this.display();
-    }));
+    new import_obsidian.Setting(containerEl)
+      .setName("Enable encryption")
+      .setDesc("When enabled, your PAT is encrypted and you'll be prompted once per session when it's first needed.")
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.useEncryption)
+        .onChange(async (value) => {
+          if (this.plugin.settings.useEncryption && !value) {
+            const ok = await new ConfirmationModal(this.app, "Disable encryption?", "Your PAT will be stored in plain text locally. Are you sure?").open();
+            if (!ok) {
+              // Revert UI state
+              this.plugin.settings.useEncryption = true;
+              await this.plugin.saveSettings();
+              this.display();
+              return;
+            }
+          }
+          this.plugin.settings.useEncryption = value;
+          await this.plugin.saveSettings();
+          this.display();
+        }));
+
     if (this.plugin.settings.useEncryption) {
+      // Encrypted mode UI: master password field + token field + save encrypted token button
       new import_obsidian.Setting(containerEl).setName("Master password").setDesc("Set a password to encrypt your token. This is NOT saved.").addText((text) => {
         text.inputEl.type = "password";
         text.setPlaceholder("Enter password to set/change token");
@@ -597,13 +1185,30 @@ var GitHubUploaderSettingTab = class extends import_obsidian.PluginSettingTab {
         try {
           const encrypted = await encrypt(this.githubToken, this.masterPassword);
           this.plugin.settings.encryptedToken = encrypted;
+          // Clear plain token for security when switching to encrypted mode
+          this.plugin.settings.plainToken = "";
           await this.plugin.saveSettings();
           new import_obsidian.Notice("Token has been encrypted and saved!");
         } catch (e) {
           new import_obsidian.Notice(`Encryption failed: ${e.message}`);
         }
       }));
+    } else {
+      // Plain mode UI: simple plain PAT field, no password prompts
+      new import_obsidian.Setting(containerEl)
+        .setName("GitHub personal access token (plain)")
+        .setDesc("Stored in plain text. No password prompts in this mode.")
+        .addText((text) => {
+          text.inputEl.type = "password";
+          text.setPlaceholder("ghp_... (paste token)");
+          text.setValue(this.plugin.settings.plainToken || "");
+          text.onChange(async (value) => {
+            this.plugin.settings.plainToken = value;
+            await this.plugin.saveSettings();
+          });
+        });
     }
   }
 };
 module.exports = MyPlugin;
+

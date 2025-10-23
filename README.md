@@ -3,7 +3,7 @@
 [![Built for Obsidian](https://img.shields.io/badge/Built%20for-Obsidian-7B68EE.svg?style=for-the-badge)](https://obsidian.md)
 [![Release Version](https://img.shields.io/github/v/release/AyushParkara/NotePix?style=for-the-badge&sort=semver)](https://github.com/AyushParkara/NotePix/releases/)
 
-NotePix automatically uploads images, screenshots, and other assets from your Obsidian vault to a designated GitHub repository. It then seamlessly replaces the local link with a fast, CDN-hosted URL for public repos, or a secure internal link for private repos, keeping your vault lightweight and portable.
+NotePix automatically uploads images, screenshots, and other assets from your Obsidian vault to a designated GitHub repository. It then seamlessly replaces the local link with a GitHub-hosted URL for public repos, or a secure internal link for private repos, keeping your vault lightweight and portable.
 
 ![NotePix Demo GIF](https://raw.githubusercontent.com/AyushParkara/NotePix/main/assets/notepix-demo.gif)
 
@@ -11,8 +11,9 @@ NotePix automatically uploads images, screenshots, and other assets from your Ob
 
 -   **Seamless Automation**: Just paste or drag an image into a note. NotePix handles the rest.
 -   **Private Repository Support**: Securely store your images in a private GitHub repository. NotePix fetches and displays them on-the-fly in Reading View.
+-   **Smart Hover Detection**: Password prompts only appear in main document views. Hover previews and page previews work seamlessly without interrupting your workflow.
 -   **Secure Token Storage**: Your GitHub Personal Access Token (PAT) is **never** stored in plain text. It is encrypted using AES-GCM, and you are prompted for a master password to decrypt it once per session.
--   **Fast CDN Links**: For public repositories, NotePix uses a fast CDN to serve images, ensuring quick load times anywhere in the world.
+-   **GitHub-Hosted Links**: For public repositories, NotePix uses direct GitHub links to serve images.
 -   **Customizable**: Configure the target repository, branch, and folder path to fit your workflow.
 -   **Clean Up**: Optionally delete the local image file after a successful upload to save space.
 -   **Mobile Compatible**: Works on both Obsidian Desktop and Mobile.
@@ -24,15 +25,16 @@ The process differs slightly depending on whether your repository is public or p
 #### For Public Repositories:
 1.  **Paste an Image**: When you paste an image, Obsidian creates a local file.
 2.  **Automatic Upload**: NotePix detects this new file and uploads it to your configured **public** GitHub repository.
-3.  **Link Replacement**: The local `![[image.png]]` embed is automatically replaced with a public CDN markdown link `![](https://raw.githubusercontent.com/...)`. This link works everywhere.
+3.  **Link Replacement**: The local `![[image.png]]` embed is automatically replaced with a public GitHub markdown link `![](https://raw.githubusercontent.com/...)`. This link works everywhere.
 
 #### For Private Repositories:
 1.  **Paste an Image**: The upload process is identical. The image is uploaded to your **private** GitHub repository.
 2.  **Link Replacement**: The local link is replaced with a special internal link, like `![](obsidian://notepix/assets/image.png)`.
 3.  **Editor View**: This special link will appear **broken** in Live Preview or Source Mode, as the editor cannot access private files.
 4.  **Reading View**: When you switch to **Reading View**, NotePix intercepts this link, uses your secure token to fetch the image directly from your private repo, and displays it seamlessly.
+5.  **Hover Previews**: When you hover over links to notes with private images, the images load automatically without password prompts, using your cached session token.
 
-If encryption is enabled, the plugin will prompt you for your master password the first time you upload or view an image in a session to securely decrypt your GitHub token.
+If encryption is enabled, the plugin will prompt you for your master password **once per session** when you first open a note with private images. After that, all subsequent views (including hover previews and page previews) will use the cached token without any prompts.
 
 ## 🚀 Setup Guide
 
@@ -69,7 +71,7 @@ NotePix needs a token to be able to upload files to your repository.
 | :--- | :--- | :--- |
 | **GitHub Username** | Your GitHub username (case-sensitive). | `AyushParkara` |
 | **Repository Name** | The name of the repository you created in Step 1. | `obsidian-assets` |
-| **Repository Visibility** | Choose 'Public' for CDN links or 'Private' for secure, on-the-fly image loading. | `Public` / `Private` |
+| **Repository Visibility** | Choose 'Public' for GitHub-hosted links or 'Private' for secure, on-the-fly image loading. | `Public` / `Private` |
 | **Branch Name** | The branch to upload files to. | `main` or `master` |
 | **Folder Path in Repository** | The directory inside your repo to store images. A `/` is added automatically. | `assets/` |
 | **Delete Local File** | If enabled, the original image file is deleted from your vault after a successful upload. | `true` / `false` |
@@ -82,6 +84,8 @@ NotePix needs a token to be able to upload files to your repository.
 4.  Click **"Save Encrypted Token"**. A notice will confirm it has been saved securely.
 
 You are all set! The next time you paste an image, NotePix will handle the upload according to your settings.
+
+
 
 ## 🙏 Support
 

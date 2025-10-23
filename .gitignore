@@ -1,0 +1,16 @@
+# Development notes and changelogs
+DEV_NOTES_CHANGELOG.txt
+
+# Node modules (if any)
+node_modules/
+
+# Build artifacts
+*.map
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
