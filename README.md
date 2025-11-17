@@ -17,6 +17,7 @@ NotePix automatically uploads images, screenshots, and other assets from your Ob
 -   **Customizable**: Configure the target repository, branch, and folder path to fit your workflow.
 -   **Clean Up**: Optionally delete the local image file after a successful upload to save space.
 -   **Mobile Compatible**: Works on both Obsidian Desktop and Mobile.
+-   **Mobile improvements (Android/iOS)**: Uses the Obsidian attachment folder on mobile, fixes link replacement for attachment-button screenshots, and only deletes local images after the note link has been successfully updated.
 
 ## ⚙️ How it Works
 
