@@ -30,6 +30,13 @@ function escapeRegex(value) {
 // Platform detection
 const isMobile = !!(import_obsidian.Platform && import_obsidian.Platform.isMobile);
 
+// CodeMirror 6 view classes for Live Preview rendering (issue #6). Obsidian
+// overloads require("@codemirror/*") at runtime to return its own internal
+// instances, so no bundling is needed. Wrapped in try/catch so the plugin still
+// loads if these are ever unavailable (older builds / unexpected environments).
+let cm6View = null;
+try { cm6View = require("@codemirror/view"); } catch (_) { cm6View = null; }
+
 // crypto.ts
 var PBKDF2_ITERATIONS = 1e5;
 var ALGORITHM = "AES-GCM";
@@ -112,7 +119,23 @@ var DEFAULT_SETTINGS = {
     integrateAttachmentsOnMobile: true,
     // Repo mismatch prompt suppression
     lastPromptedAt: 0,
-    lastPromptedRepo: ''
+    lastPromptedRepo: '',
+    // Optional extra: jsDelivr CDN links for PUBLIC repos (off by default).
+    // jsDelivr only serves public repos, so this is ignored/forced-off for
+    // private repos (and in auto mode when a private repo is detected).
+    useCdn: false,
+    // Optional extra: where uploads are stored in the repo.
+    //   'global'     -> everything in folderPath (default, current behavior)
+    //   'byNotePath' -> mirror the note's vault path under byNotePathBaseFolder
+    imageStorageStrategy: 'global',
+    byNotePathBaseFolder: 'assets',
+    // Optional extra: name pasted images after the heading they sit under,
+    //   e.g. "Installation-1.png" (off by default → timestamp names). Stable:
+    //   based on heading TEXT, not position, so inserting headings elsewhere
+    //   never renames anything (no destructive renumber needed).
+    headingBasedNaming: false,
+    // Persisted per-(note|heading) running counters for headingBasedNaming.
+    imageCounters: {}
 };
 var MyPlugin = class extends import_obsidian.Plugin {
     constructor() {
@@ -503,6 +526,81 @@ var MyPlugin = class extends import_obsidian.Plugin {
 
         // Register the processor that will handle our custom image URLs
         this.registerMarkdownPostProcessor(this.postProcessImages.bind(this));
+
+        // Issue #6: render private (v2) images in Live Preview (edit mode).
+        // Inactive (no-op) if CM6 view classes are unavailable; Reading View
+        // rendering via postProcessImages is unaffected either way.
+        try {
+            const lpExtension = this.buildLivePreviewExtension();
+            if (lpExtension) this.registerEditorExtension(lpExtension);
+        } catch (e) {
+            console.error("NotePix: failed to register Live Preview extension", e);
+        }
+
+        // Command: upload images that are ALREADY embedded in the current note.
+        // Additive feature (issue #8): does not change paste/drag/auto-upload flows.
+        this.addCommand({
+            id: 'upload-all-local-images-in-note',
+            name: 'Upload all local images in current note',
+            editorCallback: (editor, view) => {
+                const activeFile = view?.file;
+                if (!activeFile) {
+                    new import_obsidian.Notice("No active note found.");
+                    return;
+                }
+                this.uploadAllLocalImagesInNote(activeFile);
+            }
+        });
+
+        // Issue #7: editor right-click → delete the NotePix image under the cursor
+        // (GitHub + note), with multi-note guard. Editor-only by design (BP-2).
+        this.registerEvent(
+            this.app.workspace.on("editor-menu", (menu, editor, view) => {
+                try {
+                    const cursor = editor.getCursor();
+                    const lineText = editor.getLine(cursor.line);
+                    const found = this.findManagedEmbedOnLine(lineText, cursor.ch);
+                    if (!found) return; // no NotePix image here → no menu item
+                    menu.addItem((item) => {
+                        item.setTitle("NotePix: Delete image (GitHub + note)")
+                            .setIcon("trash")
+                            .onClick(() => this.handleDeleteImageAtCursor(editor, view));
+                    });
+                } catch (e) {
+                    console.error("NotePix: editor-menu handler error", e);
+                }
+            })
+        );
+
+        // Issue #7: command to find and review orphaned GitHub images (report-only).
+        this.addCommand({
+            id: 'find-orphan-images',
+            name: 'Find orphaned images on GitHub (review before deleting)',
+            callback: () => this.findOrphanImages()
+        });
+
+        // Issue #7: multi-select delete — checklist of the current note's images.
+        this.addCommand({
+            id: 'delete-images-in-note',
+            name: 'Delete images in current note (multi-select)',
+            editorCallback: () => this.openMultiDeleteForActiveNote()
+        });
+
+        // Optional extra: convert image link format in the current note (public).
+        this.addCommand({
+            id: 'convert-note-links-to-cdn',
+            name: 'Convert image links in note to jsDelivr CDN',
+            editorCallback: (editor, view) => {
+                if (view?.file) this.convertNoteLinkFormat(view.file, 'cdn');
+            }
+        });
+        this.addCommand({
+            id: 'convert-note-links-to-raw',
+            name: 'Convert image links in note to GitHub raw',
+            editorCallback: (editor, view) => {
+                if (view?.file) this.convertNoteLinkFormat(view.file, 'raw');
+            }
+        });
 
         // Paste handler (baseline behavior)
         this.registerEvent(
@@ -985,6 +1083,133 @@ var MyPlugin = class extends import_obsidian.Plugin {
         return choice;
     }
 
+    // --- Optional extra: build a PUBLIC image URL (raw or jsDelivr CDN) ---
+    // CDN is only valid for PUBLIC repos (jsDelivr can't serve private repos →
+    // 404). Callers only reach this on the public/safe branches, but we pass the
+    // detected privacy so 'auto' never emits a CDN link for a private repo.
+    // Returns a raw URL unless useCdn is on AND the repo is known-public.
+    buildPublicImageUrl(filePath, detectedPrivacy) {
+        const user = this.settings.githubUser;
+        const repo = this.settings.repoName;
+        const branch = this.settings.branchName;
+        // Encode path segments (spaces/unicode from byNotePath note names) while
+        // preserving slashes, so the resulting URL is always valid (Option B).
+        const encPath = this.encodeRepoPath(filePath);
+        const rawUrl = `https://raw.githubusercontent.com/${user}/${repo}/${branch}/${encPath}`;
+        if (!this.settings.useCdn) return rawUrl;
+        // Never emit CDN for a private (or unknown) repo — it would 404.
+        if (detectedPrivacy === 'private' || detectedPrivacy === 'unknown') return rawUrl;
+        return `https://cdn.jsdelivr.net/gh/${user}/${repo}@${branch}/${encPath}`;
+    }
+
+    // --- Optional extra: byNotePath storage ---
+    // Clean one path segment WITHOUT changing the real name (Option B). We keep
+    // the note's actual name (spaces, unicode, accents) — those are made URL-safe
+    // by encodeRepoPath() at every URL build site. We only strip characters that
+    // are illegal in a path segment / would break the slash structure:
+    //   / \  (segment separators), and the leading/trailing dots & whitespace
+    //   that are invalid as a folder name. Everything else is preserved verbatim.
+    cleanRepoSegment(segment) {
+        return String(segment || '')
+            .replace(/[\\/]+/g, ' ')           // a slash inside a name can't be a separator
+            .split('')
+            .filter(ch => ch.charCodeAt(0) >= 32) // drop control characters
+            .join('')
+            .replace(/^[.\s]+|[.\s]+$/g, '')   // no leading/trailing dot or space
+            .trim()
+            || 'untitled';
+    }
+
+    // Decide the repo folder a given note's images go into.
+    //  - global: settings.folderPath (current behavior)
+    //  - byNotePath: byNotePathBaseFolder + the note's vault folder + note name,
+    //    real names preserved. e.g. note "Projects/My Note.md" with base "assets"
+    //    -> "assets/Projects/My Note" (the space survives; URLs encode it).
+    //    A null/empty notePath falls back to the global folder so uploads never
+    //    break when the note is unknown.
+    getRepoFolderForNote(notePath) {
+        const norm = (p) => String(p || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+        if ((this.settings.imageStorageStrategy || 'global') !== 'byNotePath') {
+            return norm(this.settings.folderPath || '');
+        }
+        const np = norm(notePath);
+        if (!np) return norm(this.settings.folderPath || ''); // unknown note → safe fallback
+        const base = norm(this.settings.byNotePathBaseFolder || 'assets')
+            .split('/').map(s => this.cleanRepoSegment(s)).filter(Boolean).join('/');
+        // Strip a trailing .md extension, then clean each folder + the note name.
+        const noNoteExt = np.replace(/\.md$/i, '');
+        const parts = noNoteExt.split('/').map(s => this.cleanRepoSegment(s)).filter(Boolean);
+        return [base, ...parts].filter(Boolean).join('/');
+    }
+
+    // --- Optional extra: heading-text-based filenames ---
+    // Turn a heading's text into a safe, readable filename slug. Keeps letters
+    // (incl. unicode), digits; spaces/punctuation collapse to '-'. Trims edge
+    // dashes. Empty/None → 'section'. (Encoding still applies at URL sites, but
+    // a slug keeps names tidy and link-friendly.)
+    slugifyHeading(text) {
+        return String(text || '')
+            .trim()
+            .replace(/[\\/]+/g, '-')        // never introduce path separators
+            .replace(/\s+/g, '-')           // spaces → dash
+            .replace(/[^\p{L}\p{N}._-]+/gu, '-') // punctuation/symbols → dash (unicode letters kept)
+            .replace(/-{2,}/g, '-')         // collapse repeats
+            .replace(/^[.\-]+|[.\-]+$/g, '') // trim edge dot/dash
+            || 'section';
+    }
+
+    // Next running counter for a (notePath | headingSlug) pair, persisted in
+    // settings.imageCounters so numbering survives restarts. Saves asynchronously.
+    async getNextHeadingCounter(notePath, headingSlug) {
+        if (!this.settings.imageCounters || typeof this.settings.imageCounters !== 'object') {
+            this.settings.imageCounters = {};
+        }
+        const key = `${notePath}|${headingSlug}`;
+        const next = (this.settings.imageCounters[key] || 0) + 1;
+        this.settings.imageCounters[key] = next;
+        await this.saveSettings();
+        return next;
+    }
+
+    // Build a heading-based filename for the image being pasted, e.g.
+    // "Installation-1.png". Uses the heading whose start line is the last one at
+    // or before the cursor (the section the cursor sits in). Returns null when
+    // naming is off, there's no editor/cursor, or no heading precedes the cursor
+    // — caller then falls back to the timestamp name.
+    async generateHeadingBasedFileName(activeView, extension) {
+        if (!this.settings.headingBasedNaming) return null;
+        const file = activeView?.file;
+        if (!file) return null;
+
+        // Base name = the NOTE's name (always available). If the cursor sits under
+        // a heading, refine it to "<note>-<heading>" for extra context. This means
+        // a note "Untitled" with no headings still yields "Untitled-1.png" (never a
+        // timestamp), which is what users expect.
+        const noteSlug = this.slugifyHeading(file.basename || 'note');
+        let baseSlug = noteSlug;
+
+        const editor = activeView?.editor;
+        if (editor && typeof editor.getCursor === 'function') {
+            const cache = this.app.metadataCache.getFileCache(file);
+            const headings = cache?.headings;
+            if (Array.isArray(headings) && headings.length > 0) {
+                const cursorLine = editor.getCursor().line;
+                let current = null;
+                for (let i = headings.length - 1; i >= 0; i--) {
+                    const line = headings[i]?.position?.start?.line;
+                    if (typeof line === 'number' && line <= cursorLine) { current = headings[i]; break; }
+                }
+                if (current) {
+                    const headingSlug = this.slugifyHeading(current.heading);
+                    if (headingSlug && headingSlug !== 'section') baseSlug = `${noteSlug}-${headingSlug}`;
+                }
+            }
+        }
+
+        const counter = await this.getNextHeadingCounter(file.path, baseSlug);
+        return `${baseSlug}-${counter}.${extension}`;
+    }
+
     async handleImageUpload(file, isPaste = false) {
         if (!this.settings.githubUser || !this.settings.repoName) {
             new import_obsidian.Notice("GitHub User and Repo Name must be configured.");
@@ -995,12 +1220,18 @@ var MyPlugin = class extends import_obsidian.Plugin {
         const uploadNotice = new import_obsidian.Notice(`Uploading ${file.name} to GitHub...`, 0);
         try {
             const timestamp = new Date().toISOString().replace(/[-:.]/g, "");
-            const newFileName = `${timestamp}.${file.extension}`;
+            // Optional heading-based name (e.g. "Installation-1.png"); else timestamp.
+            const activeView = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
+            const headingName = await this.generateHeadingBasedFileName(activeView, file.extension);
+            const newFileName = headingName || `${timestamp}.${file.extension}`;
             const fileData = await (isPaste ? file.readBinary() : this.app.vault.readBinary(file));
 
             const base64Data = arrayBufferToBase64(fileData);
-            const filePath = joinRepoPath(this.settings.folderPath, newFileName);
-            const apiUrl = `https://api.github.com/repos/${this.settings.githubUser}/${this.settings.repoName}/contents/${filePath}`;
+            // byNotePath: use the active note's path to derive the repo folder
+            // (best-effort; falls back to global folder when unknown).
+            const activeNotePath = activeView?.file?.path || '';
+            const filePath = joinRepoPath(this.getRepoFolderForNote(activeNotePath), newFileName);
+            const apiUrl = `https://api.github.com/repos/${this.settings.githubUser}/${this.settings.repoName}/contents/${this.encodeRepoPath(filePath)}`;
             const requestBody = {
                 message: `feat: Add image '${newFileName}' from Obsidian`,
                 content: base64Data,
@@ -1040,8 +1271,8 @@ var MyPlugin = class extends import_obsidian.Plugin {
                     finalUrl = `obsidian://notepix/v2/${encOwner}/${encRepo}/${encBranch}/${encPath}`;
                     new import_obsidian.Notice("Private repo detected. Private image link created.");
                 } else {
-                    // Public or unknown — use raw URL (safe fallback)
-                    finalUrl = `https://raw.githubusercontent.com/${this.settings.githubUser}/${this.settings.repoName}/${this.settings.branchName}/${filePath}`;
+                    // Public or unknown — use raw (or CDN if enabled & known-public).
+                    finalUrl = this.buildPublicImageUrl(filePath, detectedPrivacy);
                     if (detectedPrivacy === 'unknown') {
                         new import_obsidian.Notice("Could not detect repo privacy. Using public URL as fallback.");
                     }
@@ -1062,7 +1293,8 @@ var MyPlugin = class extends import_obsidian.Plugin {
                     const encPath = filePath.split('/').map(encodeURIComponent).join('/');
                     finalUrl = `obsidian://notepix/v2/${encOwner}/${encRepo}/${encBranch}/${encPath}`;
                 } else {
-                    finalUrl = `https://raw.githubusercontent.com/${this.settings.githubUser}/${this.settings.repoName}/${this.settings.branchName}/${filePath}`;
+                    // Public (forced, and not detected private here) — raw or CDN.
+                    finalUrl = this.buildPublicImageUrl(filePath, detectedPrivacy);
                 }
             }
 
@@ -1087,6 +1319,1643 @@ var MyPlugin = class extends import_obsidian.Plugin {
             new import_obsidian.Notice(`Upload failed: ${error.message}`);
             console.error("GitHub Uploader Error:", error);
         }
+    }
+
+    // --- Issue #8: upload images ALREADY embedded in the current note ---
+    // Design (verified against renmu123/obsidian-image-auto-upload-plugin and
+    // addozhang/obsidian-image-upload-toolkit): collect every embedded local image
+    // once, upload them ALL first while building a {source -> finalUrl} map, then do
+    // exactly ONE write back to the note. No per-file editor rewrite, so the
+    // race that clobbers earlier replacements cannot happen.
+    //
+    // Write target is the note captured at start (by file handle), not the live
+    // visible editor — so the result lands in the correct note even if the user
+    // switches away mid-upload. When that same note is still open and active, we
+    // write through its editor to stay in sync with any live typing.
+
+    // Upload one file and RETURN its final URL (no editor side effects).
+    // linkMode is resolved once per batch so we never re-prompt mid-loop.
+    // index keeps filenames unique within a single batch (timestamps alone can collide).
+    async uploadSingleImageReturningUrl(file, token, linkMode, index = 0, notePath = "") {
+        const timestamp = new Date().toISOString().replace(/[-:.]/g, "");
+        const suffix = index > 0 ? `-${index}` : "";
+        const newFileName = `${timestamp}${suffix}.${file.extension}`;
+        const fileData = await this.app.vault.readBinary(file);
+        const base64Data = arrayBufferToBase64(fileData);
+        const filePath = joinRepoPath(this.getRepoFolderForNote(notePath), newFileName);
+        const apiUrl = `https://api.github.com/repos/${this.settings.githubUser}/${this.settings.repoName}/contents/${this.encodeRepoPath(filePath)}`;
+        const requestBody = {
+            message: `feat: Add image '${newFileName}' from Obsidian`,
+            content: base64Data,
+            branch: this.settings.branchName
+        };
+        const response = await fetch(apiUrl, {
+            method: "PUT",
+            headers: {
+                "Authorization": `token ${token}`,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify(requestBody)
+        });
+        if (!response.ok) {
+            let message = `HTTP ${response.status}`;
+            try { message = (await response.json()).message || message; } catch (_) { }
+            throw new Error(`GitHub API Error: ${message}`);
+        }
+
+        if (linkMode === 'private') {
+            const encOwner = encodeURIComponent(this.settings.githubUser);
+            const encRepo = encodeURIComponent(this.settings.repoName);
+            const encBranch = encodeURIComponent(this.settings.branchName);
+            const encPath = filePath.split('/').map(encodeURIComponent).join('/');
+            return `obsidian://notepix/v2/${encOwner}/${encRepo}/${encBranch}/${encPath}`;
+        }
+        // linkMode 'raw' is only chosen for public/unknown repos by
+        // resolveBatchLinkMode, so the repo is known-not-private here.
+        return this.buildPublicImageUrl(filePath, 'public');
+    }
+
+    // Decide the link format for a whole batch, prompting at most once (mirrors
+    // the single-upload logic in handleImageUpload, minus the per-file notices).
+    async resolveBatchLinkMode() {
+        if (this.settings.repoVisibility === 'private') return 'private';
+        if (this.settings.repoVisibility === 'auto') {
+            const detected = await this.getRepoPrivacy();
+            return detected === 'private' ? 'private' : 'raw';
+        }
+        // Forced public mode: warn once if the repo is actually private.
+        const detected = await this.getRepoPrivacy();
+        if (detected === 'private') {
+            const repoKey = `${(this.settings.githubUser || '').trim()}/${(this.settings.repoName || '').trim()}`;
+            await this.maybePromptRepoMismatch(repoKey);
+            if (this.settings.repoVisibility !== 'public') return 'private';
+        }
+        return 'raw';
+    }
+
+    // Scan a markdown snapshot for image embeds, both wikilink (![[...]]) and
+    // markdown (![alt](url)) forms. Returns raw occurrences in document order:
+    //   { source, isWiki, inner }            for wikilinks
+    //   { source, isWiki, altRaw, urlRaw }    for markdown links
+    // A hand-written scanner is used (not a single regex) so that filenames
+    // containing parentheses — e.g. ![](my(file).png) — and <...>-wrapped URLs
+    // are parsed correctly via balanced-paren tracking.
+    parseImageEmbeds(content) {
+        const out = [];
+        if (!content) return out;
+        const n = content.length;
+        let i = 0;
+        while (i < n) {
+            const bang = content.indexOf('![', i);
+            if (bang < 0) break;
+
+            // Wikilink embed: ![[ ... ]]
+            if (content[bang + 2] === '[') {
+                const end = content.indexOf(']]', bang + 3);
+                const inner = end >= 0 ? content.slice(bang + 3, end) : '';
+                if (end < 0 || inner.includes('\n')) { i = bang + 2; continue; }
+                out.push({ source: content.slice(bang, end + 2), isWiki: true, inner, from: bang, to: end + 2 });
+                i = end + 2;
+                continue;
+            }
+
+            // Markdown embed: ![alt](url) — alt then a parenthesised target.
+            const altEnd = content.indexOf(']', bang + 2);
+            const altRaw = altEnd >= 0 ? content.slice(bang + 2, altEnd) : '';
+            if (altEnd < 0 || altRaw.includes('\n') || content[altEnd + 1] !== '(') {
+                i = bang + 2;
+                continue;
+            }
+            let j = altEnd + 2;
+            let urlRaw = '';
+            let fullEnd = -1;
+            if (content[j] === '<') {
+                // Angle-wrapped URL: read to '>', then the closing ')'.
+                const gt = content.indexOf('>', j + 1);
+                const close = gt >= 0 ? content.indexOf(')', gt + 1) : -1;
+                if (gt < 0 || close < 0 || content.slice(j, close).includes('\n')) { i = altEnd + 1; continue; }
+                urlRaw = content.slice(j, close);
+                fullEnd = close + 1;
+            } else {
+                // Bare URL: walk forward, balancing parentheses so names with
+                // ( ) are kept whole; stop at the parenthesis that closes the link.
+                let depth = 1;
+                let k = j;
+                for (; k < n; k++) {
+                    const c = content[k];
+                    if (c === '\n') break;
+                    if (c === '(') depth++;
+                    else if (c === ')') { depth--; if (depth === 0) break; }
+                }
+                if (k >= n || content[k] !== ')') { i = altEnd + 1; continue; }
+                urlRaw = content.slice(j, k);
+                fullEnd = k + 1;
+            }
+            out.push({ source: content.slice(bang, fullEnd), isWiki: false, altRaw, urlRaw, from: bang, to: fullEnd });
+            i = fullEnd;
+        }
+        return out;
+    }
+
+    // From a markdown link target, strip <...> wrapping and a trailing "title",
+    // returning the bare path used to resolve the file.
+    extractMarkdownLinkPath(urlRaw) {
+        let linkPath = (urlRaw || '').trim();
+        if (linkPath.startsWith('<') && linkPath.endsWith('>')) {
+            linkPath = linkPath.slice(1, -1).trim();
+        }
+        const titleMatch = linkPath.match(/^(.*\S)\s+"[^"]*"$/);
+        if (titleMatch) linkPath = titleMatch[1].trim();
+        return linkPath;
+    }
+
+    // Convert a wikilink inner ("path|cap|200" / "path#heading") into:
+    //   { linkPath }  the bare path used to resolve the file, and
+    //   { alt }       the markdown alt text that preserves caption + size,
+    //                 e.g. "cap|200", "|200", "my caption", or "".
+    parseWikiInner(inner) {
+        const parts = String(inner || '').split('|');
+        const linkPath = (parts[0] || '').split('#')[0].trim();
+        const sizeRe = /^\d+(?:x\d+)?$/;
+        let size = '';
+        const captions = [];
+        for (const field of parts.slice(1)) {
+            const f = field.trim();
+            if (!f) continue;
+            if (sizeRe.test(f)) size = f; // last size token wins (matches Obsidian)
+            else captions.push(f);
+        }
+        const caption = captions.join(' ');
+        let alt = caption;
+        if (size) alt = caption ? `${caption}|${size}` : `|${size}`;
+        return { linkPath, alt };
+    }
+
+    // Resolve image embeds to TFiles, preserving caption/size as markdown alt text.
+    // Returns one entry per distinct source occurrence: { source, file, alt }.
+    // `source` is the exact note text (replaced verbatim); `alt` is what to place
+    // before the URL so ![caption|200](url) keeps the original display. Already
+    // remote links (http/https/obsidian) and non-image targets are skipped.
+    collectLocalImageEmbeds(content, activeFile) {
+        const imageExtensions = ["png", "jpg", "jpeg", "gif", "bmp", "svg", "webp", "avif"];
+        const entries = [];
+        const seenSources = new Set();
+
+        for (const embed of this.parseImageEmbeds(content)) {
+            const { source } = embed;
+            if (!source || seenSources.has(source)) continue;
+
+            let linkPath;
+            let alt;
+            if (embed.isWiki) {
+                const parsed = this.parseWikiInner(embed.inner);
+                linkPath = parsed.linkPath;
+                alt = parsed.alt;
+            } else {
+                linkPath = this.extractMarkdownLinkPath(embed.urlRaw);
+                alt = embed.altRaw; // already in caption|size form; keep verbatim
+            }
+            if (!linkPath) continue;
+
+            const lower = linkPath.toLowerCase();
+            if (lower.startsWith('http://') || lower.startsWith('https://') || lower.startsWith('obsidian://')) {
+                continue;
+            }
+
+            const decoded = (() => { try { return decodeURIComponent(linkPath); } catch (_) { return linkPath; } })();
+            const dest = this.app.metadataCache.getFirstLinkpathDest(decoded, activeFile.path);
+            if (!(dest instanceof import_obsidian.TFile)) continue;
+            if (!imageExtensions.includes((dest.extension || '').toLowerCase())) continue;
+
+            seenSources.add(source);
+            entries.push({ source, file: dest, alt: alt || '' });
+        }
+
+        return entries;
+    }
+
+    async uploadAllLocalImagesInNote(activeFile) {
+        if (!this.settings.githubUser || !this.settings.repoName) {
+            new import_obsidian.Notice("GitHub User and Repo Name must be configured.");
+            return;
+        }
+        if (!(activeFile instanceof import_obsidian.TFile) || !activeFile.path.endsWith('.md')) {
+            new import_obsidian.Notice("Open a markdown note to upload its images.");
+            return;
+        }
+
+        const token = await this.getToken();
+        if (!token) return;
+
+        // Snapshot the note from the live editor if it is the active note, else from disk.
+        const startView = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
+        const startFromEditor = !!(startView && startView.editor && startView.file && startView.file.path === activeFile.path);
+        let snapshot;
+        try {
+            snapshot = startFromEditor ? startView.editor.getValue() : await this.app.vault.read(activeFile);
+        } catch (e) {
+            new import_obsidian.Notice("Could not read the note to scan for images.");
+            console.error("NotePix: uploadAll read error:", e);
+            return;
+        }
+
+        const entries = this.collectLocalImageEmbeds(snapshot, activeFile);
+        if (entries.length === 0) {
+            new import_obsidian.Notice("No local images found to upload in this note.");
+            return;
+        }
+
+        // Upload each unique file once; map every occurrence-source to the resulting URL.
+        const uniqueFiles = new Map();
+        for (const entry of entries) {
+            if (!uniqueFiles.has(entry.file.path)) uniqueFiles.set(entry.file.path, entry.file);
+        }
+
+        const linkMode = await this.resolveBatchLinkMode();
+        const progress = new import_obsidian.Notice(`Uploading 0/${uniqueFiles.size} image(s)...`, 0);
+        const urlByPath = new Map();
+        let done = 0;
+        let failed = 0;
+        for (const [path, file] of uniqueFiles) {
+            try {
+                const url = await this.uploadSingleImageReturningUrl(file, token, linkMode, done + failed, activeFile?.path || "");
+                urlByPath.set(path, url);
+                done++;
+            } catch (e) {
+                failed++;
+                console.error(`NotePix: failed to upload ${file.name}`, e);
+                new import_obsidian.Notice(`Failed to upload ${file.name}: ${e.message}`, 6000);
+            }
+            progress.setMessage(`Uploading ${done + failed}/${uniqueFiles.size} image(s)...`);
+        }
+        progress.hide();
+
+        if (urlByPath.size === 0) {
+            new import_obsidian.Notice("No images were uploaded. Note left unchanged.");
+            return;
+        }
+
+        // Build the single set of replacements (source text -> final markdown link).
+        const replacements = [];
+        const replacedFilePaths = new Set();
+        for (const entry of entries) {
+            const url = urlByPath.get(entry.file.path);
+            if (!url) continue; // upload failed for this file; leave its link untouched
+            // Preserve caption/size by carrying the original alt text through.
+            replacements.push({ source: entry.source, replacement: `![${entry.alt || ''}](${url})` });
+            replacedFilePaths.add(entry.file.path);
+        }
+
+        const applyReplacements = (text) => {
+            if (!text) return { text, count: 0 };
+            let out = text;
+            let count = 0;
+            for (const { source, replacement } of replacements) {
+                if (!out.includes(source)) continue;
+                out = out.split(source).join(replacement);
+                count++;
+            }
+            return { text: out, count };
+        };
+
+        // ONE write back, to the note captured at start (by handle, not the visible screen).
+        let wrote = false;
+        const endView = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
+        const sameNoteActive = !!(endView && endView.editor && endView.file && endView.file.path === activeFile.path);
+        try {
+            if (sameNoteActive) {
+                // Stay in sync with any live typing: replace within the current editor value, write once.
+                const editor = endView.editor;
+                const current = editor.getValue();
+                const result = applyReplacements(current);
+                if (result.count > 0) {
+                    const cursor = (typeof editor.getCursor === 'function') ? editor.getCursor() : null;
+                    const scroll = (typeof editor.getScrollInfo === 'function') ? editor.getScrollInfo() : null;
+                    editor.setValue(result.text);
+                    if (scroll && typeof editor.scrollTo === 'function') {
+                        try { editor.scrollTo(scroll.left, scroll.top); } catch (_) { }
+                    }
+                    if (cursor && typeof editor.setCursor === 'function') {
+                        try { editor.setCursor(cursor); } catch (_) { }
+                    }
+                    wrote = true;
+                }
+            } else if (typeof this.app.vault.process === 'function') {
+                // Not the active note: atomic read-modify-write straight to the file.
+                let count = 0;
+                await this.app.vault.process(activeFile, (data) => {
+                    const result = applyReplacements(data);
+                    count = result.count;
+                    return result.text;
+                });
+                wrote = count > 0;
+            } else {
+                // Fallback for older app versions without vault.process.
+                const data = await this.app.vault.read(activeFile);
+                const result = applyReplacements(data);
+                if (result.count > 0) {
+                    await this.app.vault.modify(activeFile, result.text);
+                    wrote = true;
+                }
+            }
+        } catch (e) {
+            console.error("NotePix: uploadAll write error:", e);
+            new import_obsidian.Notice("Images uploaded, but updating the note failed. Links left unchanged.", 8000);
+            return;
+        }
+
+        const summary = failed > 0
+            ? `Uploaded ${done}/${uniqueFiles.size} image(s), ${failed} failed.`
+            : `Uploaded ${done} image(s) and updated the note.`;
+        new import_obsidian.Notice(summary);
+
+        // Honor deleteLocal: only remove files whose link was actually replaced.
+        if (this.settings.deleteLocal && wrote) {
+            for (const [path, file] of uniqueFiles) {
+                if (!replacedFilePaths.has(path)) continue;
+                try {
+                    await this.app.vault.delete(file);
+                } catch (e) {
+                    console.error(`NotePix: failed to delete local file ${path}`, e);
+                }
+            }
+        }
+    }
+
+    // --- Issue #6: render private (v2) images in Live Preview (edit mode) ---
+    // Reading View already renders them via postProcessImages. Live Preview never
+    // runs markdown post-processors, so we add a CodeMirror editor extension that
+    // detects obsidian://notepix/v2/... image embeds and renders each as an <img>
+    // backed by the SAME in-memory blob cache used by Reading View. No temp files,
+    // no disk writes; cache + revocation are already handled in onunload.
+
+    // Return a non-prompting token usable for background image fetches.
+    // Mirrors the hover-context rules in postProcessImages: never pops a password
+    // modal here (editor rendering must stay silent).
+    getRenderTokenNoPrompt() {
+        if (this.decryptedToken) return this.decryptedToken;
+        if (!this.settings.useEncryption) {
+            return (this.settings.plainToken || '').trim() || null;
+        }
+        return null; // encrypted but not yet unlocked — caller skips rendering
+    }
+
+    // Resolve a v2 image (owner/repo/branch/path) to an in-memory blob URL,
+    // reusing this.imageCache and this.failedImageFetches exactly like tryRepo()
+    // in postProcessImages. Returns a blob URL string, or null on miss/failure.
+    async resolveNotepixBlobUrl(owner, repo, branch, path, token) {
+        if (!owner || !repo || !branch || !path || !token) return null;
+        const cacheKey = `${owner}/${repo}/${branch}/${path}`.replace(/\\\\/g, "/");
+
+        if (this.imageCache && this.imageCache.has(cacheKey)) {
+            return this.imageCache.get(cacheKey);
+        }
+        const now = Date.now();
+        const failTs = this.failedImageFetches.get(cacheKey) || 0;
+        if (failTs && (now - failTs) < 30 * 1000) {
+            return null;
+        }
+
+        const ref = encodeURIComponent(branch);
+        const norm = path.replace(/\\\\/g, "/");
+        const encSeg = (p) => p.split('/').map(encodeURIComponent).join('/');
+        const apiUrl = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encSeg(norm)}?ref=${ref}`;
+
+        try {
+            let response = await fetch(apiUrl, {
+                method: "GET",
+                headers: { "Authorization": `token ${token}`, "Accept": "application/vnd.github.v3.raw" }
+            });
+            let imageBlob;
+            if (response.ok) {
+                imageBlob = await response.blob();
+            } else {
+                response = await fetch(apiUrl, {
+                    method: "GET",
+                    headers: { "Authorization": `token ${token}`, "Accept": "application/vnd.github.v3+json" }
+                });
+                if (!response.ok) { this.failedImageFetches.set(cacheKey, Date.now()); return null; }
+                const meta = await response.json();
+                if (!meta || !meta.content) { this.failedImageFetches.set(cacheKey, Date.now()); return null; }
+                const raw = atob(meta.content.replace(/\n/g, ''));
+                const bytes = new Uint8Array(raw.length);
+                for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+                imageBlob = new Blob([bytes.buffer]);
+            }
+            const blobUrl = URL.createObjectURL(imageBlob);
+            this.imageCache.set(cacheKey, blobUrl);
+            this.failedImageFetches.delete(cacheKey);
+            return blobUrl;
+        } catch (_) {
+            this.failedImageFetches.set(cacheKey, Date.now());
+            return null;
+        }
+    }
+
+    // Parse a single image-embed line target into v2 image components.
+    // Accepts the raw URL/inner text from an embed and returns
+    // { owner, repo, branch, path, alt } for v2 links, else null.
+    // alt carries caption/size so the rendered <img> can be sized later if needed.
+    parseNotepixV2Target(urlRaw, altRaw) {
+        let url = (urlRaw || '').trim();
+        if (url.startsWith('<') && url.endsWith('>')) url = url.slice(1, -1).trim();
+        const titleMatch = url.match(/^(.*\S)\s+"[^"]*"$/);
+        if (titleMatch) url = titleMatch[1].trim();
+        if (!url.startsWith('obsidian://notepix/v2/')) return null;
+        const after = url.substring('obsidian://notepix/v2/'.length);
+        const parts = after.split('/');
+        if (parts.length < 4) return null;
+        const dec = (v) => { try { return decodeURIComponent(v); } catch (_) { return v; } };
+        return {
+            owner: dec(parts[0]),
+            repo: dec(parts[1]),
+            branch: dec(parts[2]),
+            path: parts.slice(3).map(dec).join('/'),
+            alt: altRaw || ''
+        };
+    }
+
+    // --- Issue #7 foundation: canonicalize ANY NotePix image link/URL ---
+    // Normalizes a link to { owner, repo, branch, path, kind } so that the same
+    // image expressed as v2 / raw / jsDelivr-CDN / legacy compares equal (BP-7),
+    // and so delete uses the repo+branch embedded in the LINK, never the
+    // configured repo (BP-1, BP-18). Path is normalized (BP-15): decoded once,
+    // leading/trailing slashes stripped, collapsed slashes. Returns null when the
+    // link is not a NotePix-managed image, or { ambiguous:true } for legacy links
+    // whose repo cannot be determined safely (BP-9).
+    //
+    // `legacyRepo` (optional) lets callers supply a resolved repo for legacy links
+    // (e.g. from this.legacyResolvedRepoByKey); without it, legacy => ambiguous.
+    canonicalizeImageRef(rawUrl, legacyRepo) {
+        if (!rawUrl || typeof rawUrl !== 'string') return null;
+        let url = rawUrl.trim();
+        if (url.startsWith('<') && url.endsWith('>')) url = url.slice(1, -1).trim();
+        const titleMatch = url.match(/^(.*\S)\s+"[^"]*"$/);
+        if (titleMatch) url = titleMatch[1].trim();
+
+        const dec = (v) => { try { return decodeURIComponent(v); } catch (_) { return v; } };
+        const normPath = (p) => String(p || '')
+            .replace(/\\/g, '/')
+            .replace(/^\/+|\/+$/g, '')
+            .replace(/\/{2,}/g, '/');
+
+        // 1. v2 self-describing private link.
+        if (url.startsWith('obsidian://notepix/v2/')) {
+            const parts = url.substring('obsidian://notepix/v2/'.length).split('/');
+            if (parts.length < 4) return null;
+            const path = normPath(parts.slice(3).map(dec).join('/'));
+            if (!path) return null;
+            return { owner: dec(parts[0]), repo: dec(parts[1]), branch: dec(parts[2]), path, kind: 'v2' };
+        }
+
+        // 2. raw.githubusercontent.com/<owner>/<repo>/<branch>/<path...>
+        //    Branch may contain slashes; prefer configured branch when it matches.
+        const rawMatch = url.match(/^https?:\/\/raw\.githubusercontent\.com\/([^\/]+)\/([^\/]+)\/(.+)$/i);
+        if (rawMatch) {
+            const owner = dec(rawMatch[1]);
+            const repo = dec(rawMatch[2]);
+            const rest = rawMatch[3];
+            const cfgBranch = (this.settings.branchName || '').trim();
+            let branch, path;
+            if (cfgBranch && rest.startsWith(`${cfgBranch}/`)) {
+                branch = cfgBranch;
+                path = rest.substring(cfgBranch.length + 1);
+            } else {
+                const slash = rest.indexOf('/');
+                if (slash <= 0) return null;
+                branch = rest.substring(0, slash);
+                path = rest.substring(slash + 1);
+            }
+            const np = normPath(dec(path));
+            if (!owner || !repo || !branch || !np) return null;
+            return { owner, repo, branch: dec(branch), path: np, kind: 'raw' };
+        }
+
+        // 3. jsDelivr CDN: cdn.jsdelivr.net/gh/<owner>/<repo>@<branch>/<path...>
+        const cdnMatch = url.match(/^https?:\/\/cdn\.jsdelivr\.net\/gh\/([^\/]+)\/([^@\/]+)@([^\/]+)\/(.+)$/i);
+        if (cdnMatch) {
+            const owner = dec(cdnMatch[1]);
+            const repo = dec(cdnMatch[2]);
+            const branch = dec(cdnMatch[3]);
+            const path = normPath(dec(cdnMatch[4]));
+            if (!owner || !repo || !branch || !path) return null;
+            return { owner, repo, branch, path, kind: 'cdn' };
+        }
+
+        // 4. Legacy private link: obsidian://notepix/<path> (no embedded repo).
+        if (url.startsWith('obsidian://notepix/')) {
+            const path = normPath(dec(url.substring('obsidian://notepix/'.length)));
+            if (!path) return null;
+            const owner = (this.settings.githubUser || '').trim();
+            const branch = (this.settings.branchName || 'main').trim();
+            const repo = (legacyRepo || '').trim();
+            if (!owner || !repo) {
+                // Cannot safely determine which repo holds this file (BP-9).
+                return { ambiguous: true, owner, branch, path, kind: 'legacy' };
+            }
+            return { owner, repo, branch, path, kind: 'legacy' };
+        }
+
+        return null; // not a NotePix-managed image
+    }
+
+    // Stable comparison key for two canonical refs (BP-7). Path comparison is
+    // case-SENSITIVE because GitHub paths are case-sensitive (BP-14).
+    canonicalRefKey(ref) {
+        if (!ref || ref.ambiguous) return null;
+        return `${ref.owner}/${ref.repo}/${ref.branch}/${ref.path}`;
+    }
+
+    // Extract every NotePix-managed image URL string found in a markdown text.
+    // Scans markdown image embeds AND bare obsidian://notepix / raw / cdn URLs so
+    // links inside code spans or comments still count as references (BP-20).
+    // Returns the raw URL strings (canonicalize separately).
+    extractManagedUrlsFromMarkdown(text) {
+        const urls = [];
+        if (!text) return urls;
+        // Bare URL patterns (also catches links inside `code`, %%comments%%, plain text).
+        const patterns = [
+            /obsidian:\/\/notepix\/v2\/[^\s)\]<>"']+/g,
+            /obsidian:\/\/notepix\/(?!v2\/)[^\s)\]<>"']+/g,
+            /https?:\/\/raw\.githubusercontent\.com\/[^\s)\]<>"']+/g,
+            /https?:\/\/cdn\.jsdelivr\.net\/gh\/[^\s)\]<>"']+/g,
+        ];
+        for (const re of patterns) {
+            let m;
+            while ((m = re.exec(text)) !== null) {
+                // Trim trailing punctuation that a URL regex may over-capture.
+                urls.push(m[0].replace(/[)\].,;'">]+$/, ''));
+            }
+        }
+        return urls;
+    }
+
+    // Extract NotePix-managed image URL strings referenced by a .canvas file (BP-16).
+    // Canvas stores file nodes as { "type":"file", "file":"vault/path" } and text
+    // nodes whose "text" may contain markdown image embeds. We scan both.
+    extractManagedUrlsFromCanvas(jsonText) {
+        const urls = [];
+        if (!jsonText) return urls;
+        let data;
+        try { data = JSON.parse(jsonText); } catch (_) { return urls; }
+        const nodes = Array.isArray(data?.nodes) ? data.nodes : [];
+        for (const node of nodes) {
+            if (node && typeof node.text === 'string') {
+                urls.push(...this.extractManagedUrlsFromMarkdown(node.text));
+            }
+            // A canvas "file" node usually points at a vault-local file, but if a
+            // user pasted a managed URL as a file ref, capture it too.
+            if (node && typeof node.file === 'string') {
+                urls.push(...this.extractManagedUrlsFromMarkdown(node.file));
+            }
+        }
+        return urls;
+    }
+
+    // Find every place in the vault (.md + .canvas) that references the given
+    // canonical image ref. Returns [{ path, kind, count }]. Used by the multi-note
+    // guard (BP-3) and orphan detection. Built by content-scan + canonicalization,
+    // NOT metadataCache.resolvedLinks (which only tracks local links, not remote
+    // URLs — BP-17). Optionally pass legacyRepoResolver(path)->repo for legacy links.
+    async findImageReferencesInVault(targetRef, options = {}) {
+        const targetKey = this.canonicalRefKey(targetRef);
+        if (!targetKey) return [];
+        const excludePath = options.excludePath || null;
+        const results = [];
+
+        const files = this.app.vault.getFiles
+            ? this.app.vault.getFiles()
+            : [];
+        for (const file of files) {
+            const ext = (file.extension || '').toLowerCase();
+            const isMd = ext === 'md';
+            const isCanvas = ext === 'canvas';
+            if (!isMd && !isCanvas) continue;
+
+            let content;
+            try { content = await this.app.vault.read(file); } catch (_) { continue; }
+
+            const urls = isCanvas
+                ? this.extractManagedUrlsFromCanvas(content)
+                : this.extractManagedUrlsFromMarkdown(content);
+            if (urls.length === 0) continue;
+
+            let count = 0;
+            for (const url of urls) {
+                const ref = this.canonicalizeImageRef(url);
+                if (!ref || ref.ambiguous) continue;
+                if (this.canonicalRefKey(ref) === targetKey) count++;
+            }
+            if (count > 0) {
+                results.push({ path: file.path, kind: isCanvas ? 'canvas' : 'note', count });
+            }
+        }
+
+        return options.includeSelf
+            ? results
+            : results.filter(r => r.path !== excludePath);
+    }
+
+    // --- Issue #7: GitHub delete engine ---
+    // Encode a repo-relative path for the Contents API: each segment encoded,
+    // slashes preserved (BP-15). Mirrors the encSeg used elsewhere.
+    encodeRepoPath(path) {
+        return String(path || '')
+            .replace(/\\/g, '/')
+            .replace(/^\/+|\/+$/g, '')
+            .split('/')
+            .map(encodeURIComponent)
+            .join('/');
+    }
+
+    // Classify a fetch Response into a stable outcome the callers can branch on.
+    // Distinguishes 404 (gone), 403 rate-limit vs permission, and other errors
+    // (BP-5, BP-22, BP-24). Returns one of:
+    //   'ok' | 'notFound' | 'rateLimited' | 'forbidden' | 'error'
+    classifyGitHubResponse(response) {
+        if (!response) return 'error';
+        if (response.ok) return 'ok';
+        if (response.status === 404) return 'notFound';
+        if (response.status === 403) {
+            const remaining = response.headers && typeof response.headers.get === 'function'
+                ? response.headers.get('X-RateLimit-Remaining') : null;
+            if (remaining === '0') return 'rateLimited';
+            return 'forbidden';
+        }
+        return 'error';
+    }
+
+    // Fetch the current blob SHA for a file. Returns:
+    //   { status:'ok', sha } | { status:'notFound' } | { status:'rateLimited' }
+    //   | { status:'forbidden' } | { status:'error', message }
+    // Always fetched fresh right before a delete to avoid stale-SHA 409s (BP-6).
+    async getFileShaFromGitHub(owner, repo, branch, path, token) {
+        const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${this.encodeRepoPath(path)}?ref=${encodeURIComponent(branch)}`;
+        // Use Obsidian's requestUrl (not fetch): fetch().json() can fail on a 200
+        // inside Obsidian's Electron runtime, which was causing "unreadable
+        // response HTTP 200". requestUrl returns already-parsed JSON reliably.
+        let response;
+        try {
+            response = await import_obsidian.requestUrl({
+                url,
+                method: 'GET',
+                headers: { "Authorization": `token ${token}`, "Accept": "application/vnd.github.v3+json" },
+                throw: false
+            });
+        } catch (e) {
+            return { status: 'error', message: e?.message || 'network error' }; // BP-21
+        }
+        const status = response.status;
+        if (status === 404) return { status: 'notFound', message: 'HTTP 404' };
+        if (status === 403) {
+            const remaining = response.headers && (response.headers['x-ratelimit-remaining'] ?? response.headers['X-RateLimit-Remaining']);
+            return { status: remaining === '0' ? 'rateLimited' : 'forbidden', message: 'HTTP 403' };
+        }
+        if (status < 200 || status >= 300) return { status: 'error', message: `HTTP ${status}` };
+
+        // CRITICAL: never touch response.json — in Obsidian it is a GETTER that
+        // runs JSON.parse() on access and THROWS when the body is raw file bytes
+        // (which is exactly what requestUrl returns for a Contents API file GET).
+        // Work only from the raw arrayBuffer, which is always safe to read.
+        let bytes = null;
+        try {
+            if (response.arrayBuffer) bytes = new Uint8Array(response.arrayBuffer);
+        } catch (_) { bytes = null; }
+
+        if (bytes && bytes.length) {
+            // Peek at the first non-whitespace char to tell JSON from binary.
+            let firstChar = '';
+            for (let i = 0; i < bytes.length && i < 64; i++) {
+                const c = bytes[i];
+                if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d) continue;
+                firstChar = String.fromCharCode(c); break;
+            }
+            if (firstChar === '[') {
+                return { status: 'error', message: 'path is a folder, not a file' };
+            }
+            if (firstChar === '{') {
+                // JSON metadata — parse it for the sha.
+                try {
+                    const meta = JSON.parse(new TextDecoder().decode(bytes));
+                    const jsonSha = meta && (meta.sha || (meta.content && meta.content.sha));
+                    if (jsonSha) return { status: 'ok', sha: jsonSha };
+                } catch (_) { /* fall through to blob-sha */ }
+            }
+            // Raw file bytes (the common Electron case): a GitHub file's sha IS its
+            // git blob sha — SHA1("blob " + len + "\0" + bytes) — computed locally.
+            try {
+                const sha = await this.computeGitBlobSha(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+                if (sha) return { status: 'ok', sha };
+            } catch (e) {
+                console.error('NotePix: git blob sha computation failed', e);
+            }
+        }
+
+        // Last resort: some builds expose only .text (a safe string, not a getter).
+        try {
+            if (typeof response.text === 'string' && response.text.trim().startsWith('{')) {
+                const meta = JSON.parse(response.text);
+                const jsonSha = meta && (meta.sha || (meta.content && meta.content.sha));
+                if (jsonSha) return { status: 'ok', sha: jsonSha };
+            }
+        } catch (_) { /* ignore */ }
+
+        return { status: 'error', message: `could not determine file sha (HTTP ${status})` };
+    }
+
+    // Compute a git blob SHA-1 from raw file bytes. This equals the `sha` GitHub
+    // stores for a file, so it can be used directly in a Contents API delete.
+    async computeGitBlobSha(arrayBuffer) {
+        const bytes = new Uint8Array(arrayBuffer);
+        const header = new TextEncoder().encode(`blob ${bytes.length}\0`);
+        const full = new Uint8Array(header.length + bytes.length);
+        full.set(header, 0);
+        full.set(bytes, header.length);
+        const digest = await crypto.subtle.digest('SHA-1', full);
+        return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    // Delete a single file from GitHub. Re-fetches SHA right before deleting, and
+    // retries ONCE on a 409 (stale SHA), per BP-6. Returns:
+    //   { ok:true } | { ok:false, reason:'notFound'|'rateLimited'|'forbidden'|'error', message }
+    // 404 on the SHA lookup is surfaced as 'notFound' so callers decide what it
+    // means (delete-initiated => possible case mismatch BP-14; cleanup => already gone BP-5).
+    async deleteFileFromGitHub(owner, repo, branch, path, token, _retried = false) {
+        if (!owner || !repo || !branch || !path || !token) {
+            return { ok: false, reason: 'error', message: 'missing parameters' };
+        }
+        const shaResult = await this.getFileShaFromGitHub(owner, repo, branch, path, token);
+        if (shaResult.status !== 'ok') {
+            return { ok: false, reason: shaResult.status, message: shaResult.message };
+        }
+
+        const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${this.encodeRepoPath(path)}`;
+        // requestUrl (not fetch) for the same Electron-reliability reason as above.
+        let response;
+        try {
+            response = await import_obsidian.requestUrl({
+                url,
+                method: "DELETE",
+                headers: {
+                    "Authorization": `token ${token}`,
+                    "Content-Type": "application/json",
+                    "Accept": "application/vnd.github.v3+json"
+                },
+                body: JSON.stringify({
+                    message: `chore: Delete image '${path}' via NotePix`,
+                    sha: shaResult.sha,
+                    branch
+                }),
+                throw: false
+            });
+        } catch (e) {
+            return { ok: false, reason: 'error', message: e?.message || 'network error' }; // BP-21
+        }
+
+        const status = response.status;
+        if (status >= 200 && status < 300) return { ok: true };
+
+        // 409 stale SHA — branch moved under us; re-fetch + retry once (BP-6).
+        if (status === 409 && !_retried) {
+            return this.deleteFileFromGitHub(owner, repo, branch, path, token, true);
+        }
+
+        let reason = 'error';
+        if (status === 404) reason = 'notFound';
+        else if (status === 403) {
+            const remaining = response.headers && (response.headers['x-ratelimit-remaining'] ?? response.headers['X-RateLimit-Remaining']);
+            reason = remaining === '0' ? 'rateLimited' : 'forbidden';
+        }
+        let message = `HTTP ${status}`;
+        try { if (response.json && response.json.message) message = response.json.message; } catch (_) { }
+        return { ok: false, reason, message };
+    }
+
+    // --- Issue #7: link removal + deletion orchestration ---
+    // Remove every image embed in a file whose canonical ref matches targetRef.
+    // Atomic via vault.process when available (BP-8), else read+modify with an
+    // mtime guard so a concurrent edit doesn't get clobbered. Removes ALL matching
+    // occurrences in the file (BP-19). Returns { ok, removed } (removed = count).
+    async removeLinkOccurrencesFromFile(file, targetRef) {
+        const targetKey = this.canonicalRefKey(targetRef);
+        if (!targetKey || !file) return { ok: false, removed: 0 };
+
+        const rewrite = (content) => {
+            let removed = 0;
+            const embeds = this.parseImageEmbeds(content);
+            // Collect spans to remove (markdown embeds whose URL canonicalizes to target).
+            const spans = [];
+            for (const e of embeds) {
+                if (e.isWiki) continue; // wikilinks don't carry managed remote URLs
+                const ref = this.canonicalizeImageRef(e.urlRaw);
+                if (!ref || ref.ambiguous) continue;
+                if (this.canonicalRefKey(ref) === targetKey) {
+                    spans.push({ from: e.from, to: e.to });
+                }
+            }
+            if (spans.length === 0) return { text: content, removed: 0 };
+            // Remove from the end backwards so earlier offsets stay valid.
+            spans.sort((a, b) => b.from - a.from);
+            let out = content;
+            for (const s of spans) {
+                out = out.slice(0, s.from) + out.slice(s.to);
+                removed++;
+            }
+            // Tidy: collapse a line left entirely blank by the removal (BP-25),
+            // without disturbing surrounding structure.
+            out = out.replace(/[ \t]+\n/g, '\n');
+            return { text: out, removed };
+        };
+
+        // Prefer atomic process (BP-8). Falls back to read+modify with mtime guard.
+        try {
+            if (typeof this.app.vault.process === 'function') {
+                let removed = 0;
+                await this.app.vault.process(file, (data) => {
+                    const r = rewrite(data);
+                    removed = r.removed;
+                    return r.text;
+                });
+                return { ok: true, removed };
+            }
+            const startMtime = file.stat?.mtime || 0;
+            const data = await this.app.vault.read(file);
+            const r = rewrite(data);
+            if (r.removed === 0) return { ok: true, removed: 0 };
+            const latest = this.app.vault.getAbstractFileByPath(file.path);
+            const latestMtime = (latest && latest.stat) ? (latest.stat.mtime || 0) : 0;
+            if (startMtime && latestMtime && latestMtime !== startMtime) {
+                return { ok: false, removed: 0, reason: 'changed' }; // BP-8/BP-23
+            }
+            await this.app.vault.modify(file, r.text);
+            return { ok: true, removed: r.removed };
+        } catch (e) {
+            console.error('NotePix: removeLinkOccurrencesFromFile failed', e);
+            return { ok: false, removed: 0, reason: 'error' };
+        }
+    }
+
+    // Core deletion executor — TESTABLE (no modals). The caller has already
+    // decided `scope`:
+    //   'thisOnly' -> just unlink in sourceFile, never touch GitHub
+    //   'all'      -> delete GitHub file, then unlink in sourceFile + everyLocation
+    // sourceFile: the TFile the user acted in. otherLocations: results from
+    // findImageReferencesInVault (excluding source). token: GitHub token.
+    // Order (BP-4): for 'all', delete GitHub FIRST; only unlink after ok/notFound.
+    // Guards double-run via an in-flight set keyed by canonical ref (BP-28).
+    async executeImageDeletion(canonicalRef, sourceFile, otherLocations, token, scope) {
+        if (canonicalRef && canonicalRef.ambiguous) {
+            return { status: 'ambiguous' }; // BP-9 — caller should have warned already
+        }
+        const key = this.canonicalRefKey(canonicalRef);
+        if (!key) return { status: 'error', message: 'invalid reference' };
+
+        if (!this._deletionsInFlight) this._deletionsInFlight = new Set();
+        if (this._deletionsInFlight.has(key)) return { status: 'inFlight' }; // BP-28
+        this._deletionsInFlight.add(key);
+        try {
+            // thisOnly: never touch GitHub, just unlink locally.
+            if (scope === 'thisOnly') {
+                const r = await this.removeLinkOccurrencesFromFile(sourceFile, canonicalRef);
+                return { status: r.ok ? 'unlinkedHere' : 'unlinkFailed', removed: r.removed };
+            }
+
+            // scope === 'all' — delete from GitHub first (BP-4).
+            const del = await this.deleteFileFromGitHub(
+                canonicalRef.owner, canonicalRef.repo, canonicalRef.branch, canonicalRef.path, token
+            );
+            // 404 in an explicit "delete" action may be a case mismatch (BP-14) —
+            // report it rather than silently treating as success.
+            if (!del.ok && del.reason === 'notFound') {
+                return { status: 'githubNotFound' };
+            }
+            if (!del.ok) {
+                return { status: 'githubFailed', reason: del.reason, message: del.message };
+            }
+
+            // GitHub delete succeeded — now unlink from source + all other locations.
+            const targets = [sourceFile, ...(otherLocations || []).map(l =>
+                this.app.vault.getAbstractFileByPath(l.path)).filter(Boolean)];
+            let totalRemoved = 0;
+            const unlinkFailures = [];
+            for (const f of targets) {
+                if (!f) continue;
+                const r = await this.removeLinkOccurrencesFromFile(f, canonicalRef);
+                if (r.ok) totalRemoved += r.removed;
+                else unlinkFailures.push(f.path);
+            }
+            return {
+                status: 'deleted',
+                removed: totalRemoved,
+                unlinkFailures, // GitHub gone but these notes couldn't be updated (rare)
+            };
+        } finally {
+            this._deletionsInFlight.delete(key);
+        }
+    }
+
+    // Given a single line of text and a cursor column, return the managed image
+    // embed under the cursor (BP-10) — or, if the cursor isn't on one, the only
+    // managed embed on the line. Returns { source, urlRaw } | null. A null cursor
+    // column falls back to "single managed embed on the line, else null".
+    findManagedEmbedOnLine(lineText, cursorCh) {
+        const embeds = this.parseImageEmbeds(lineText).filter(e => {
+            if (e.isWiki) return false;
+            const ref = this.canonicalizeImageRef(e.urlRaw);
+            return !!ref; // managed (incl. ambiguous legacy — caller handles BP-9)
+        });
+        if (embeds.length === 0) return null;
+        if (typeof cursorCh === 'number') {
+            const hit = embeds.find(e => cursorCh >= e.from && cursorCh <= e.to);
+            if (hit) return { source: hit.source, urlRaw: hit.urlRaw, from: hit.from, to: hit.to };
+        }
+        // No cursor hit: only act if unambiguous (exactly one on the line).
+        return embeds.length === 1
+            ? { source: embeds[0].source, urlRaw: embeds[0].urlRaw, from: embeds[0].from, to: embeds[0].to }
+            : null;
+    }
+
+    // Full right-click delete flow (live-tested): resolve the embed under the
+    // cursor, canonicalize, run the multi-note guard, show the appropriate modal,
+    // then call executeImageDeletion. Reports results via Notice.
+    async handleDeleteImageAtCursor(editor, view) {
+        const file = view?.file;
+        if (!file) { new import_obsidian.Notice("No active note."); return; }
+        const cursor = editor.getCursor();
+        const lineText = editor.getLine(cursor.line);
+        const found = this.findManagedEmbedOnLine(lineText, cursor.ch);
+        if (!found) { new import_obsidian.Notice("No NotePix image found at the cursor."); return; }
+
+        // Resolve repo for legacy links if possible (BP-9).
+        let ref = this.canonicalizeImageRef(found.urlRaw);
+        if (ref && ref.ambiguous) {
+            // Try resolved-legacy cache; otherwise refuse with a clear modal.
+            const legacyRepo = this.legacyResolvedRepoByKey
+                ? this.legacyResolvedRepoByKey.get(`${ref.owner}|${ref.branch}|${ref.path}`) : null;
+            if (legacyRepo) ref = this.canonicalizeImageRef(found.urlRaw, legacyRepo);
+        }
+        if (!ref) { new import_obsidian.Notice("Could not understand this image link."); return; }
+        await this.deleteImageByRef(ref, file);
+    }
+
+    // Shared single-image delete flow used by BOTH the editor right-click (on the
+    // link text) and the rendered-image right-click. Runs the multi-note guard,
+    // shows the right modal, executes, and reports. `file` is the note to unlink
+    // from (best-effort: the active note).
+    async deleteImageByRef(ref, file) {
+        if (!ref) { new import_obsidian.Notice("Could not understand this image link."); return; }
+        if (ref.ambiguous) {
+            await new ConfirmationModal(this.app, "Can't determine the GitHub file",
+                "This is a legacy link without repository info, so NotePix can't safely tell which GitHub file to delete. Open the image once so it resolves, then try again.").open();
+            return;
+        }
+        if (!file) {
+            const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
+            file = view?.file || null;
+        }
+        if (!file) { new import_obsidian.Notice("No active note to update."); return; }
+
+        const token = await this.getToken();
+        if (!token) return; // getToken already notifies
+
+        const refLabel = `${ref.owner}/${ref.repo}/${ref.branch}/${ref.path}`;
+        const others = await this.findImageReferencesInVault(ref, { excludePath: file.path });
+
+        let scope;
+        if (others.length > 0) {
+            scope = await new MultiNoteDeleteModal(this.app, refLabel, others).openAndWait();
+        } else {
+            const ok = await new DeleteImageModal(this.app, refLabel).openAndWait();
+            scope = ok ? 'all' : 'cancel';
+        }
+        if (scope === 'cancel') return;
+
+        const res = await this.executeImageDeletion(ref, file, others, token, scope);
+        switch (res.status) {
+            case 'unlinkedHere':
+                new import_obsidian.Notice("Removed the image link from this note."); break;
+            case 'deleted': {
+                let msg = `Deleted image from GitHub and removed ${res.removed} link(s).`;
+                if (res.unlinkFailures && res.unlinkFailures.length) {
+                    msg += ` Couldn't update: ${res.unlinkFailures.join(', ')}.`;
+                }
+                new import_obsidian.Notice(msg); break;
+            }
+            case 'githubNotFound':
+                new import_obsidian.Notice("File not found on GitHub (it may already be deleted, or the path case differs). Link left untouched.", 7000); break;
+            case 'githubFailed': {
+                const why = res.reason === 'rateLimited' ? "GitHub rate limit reached — try again later."
+                    : res.reason === 'forbidden' ? "Your token can't delete files (needs repo / contents:write)."
+                    : `GitHub delete failed: ${res.message || res.reason}`;
+                new import_obsidian.Notice(why, 8000); break;
+            }
+            case 'inFlight':
+                new import_obsidian.Notice("Already deleting this image."); break;
+            case 'unlinkFailed':
+                new import_obsidian.Notice("Could not update the note (it may have changed). Nothing deleted."); break;
+            default:
+                new import_obsidian.Notice("Delete did not complete.");
+        }
+    }
+
+    // --- Issue #7: multi-select delete (checklist of this note's images) ---
+    // List the DISTINCT managed images embedded in a note's text. Returns
+    // [{ ref, key, refLabel, displayName, count }] — one per unique GitHub file,
+    // with how many times it appears in this note. Pure/testable.
+    collectManagedImagesInNote(content) {
+        const byKey = new Map();
+        for (const embed of this.parseImageEmbeds(content)) {
+            if (embed.isWiki) continue;
+            let ref = this.canonicalizeImageRef(embed.urlRaw);
+            if (!ref) continue;
+            // Resolve legacy links via cache when possible; skip if still ambiguous.
+            if (ref.ambiguous) {
+                const legacyRepo = this.legacyResolvedRepoByKey
+                    ? this.legacyResolvedRepoByKey.get(`${ref.owner}|${ref.branch}|${ref.path}`) : null;
+                if (legacyRepo) ref = this.canonicalizeImageRef(embed.urlRaw, legacyRepo);
+            }
+            const key = this.canonicalRefKey(ref);
+            if (!key) continue; // ambiguous/unusable
+            const existing = byKey.get(key);
+            if (existing) { existing.count++; continue; }
+            byKey.set(key, {
+                ref, key,
+                refLabel: `${ref.owner}/${ref.repo}/${ref.branch}/${ref.path}`,
+                displayName: ref.path.split('/').pop() || ref.path,
+                count: 1
+            });
+        }
+        return Array.from(byKey.values());
+    }
+
+    // Bulk-delete a chosen set of images from the current note (+ GitHub), with a
+    // single up-front multi-note guard decision. `items` are entries from
+    // collectManagedImagesInNote. `sharedChoice` decides what to do with images
+    // still used elsewhere: 'skipShared' (delete only note-exclusive) or
+    // 'deleteEverywhere' (remove from all notes + GitHub). Sequential (BP-6).
+    async bulkDeleteImages(file, items, token, sharedChoice) {
+        let deleted = 0, skipped = 0, failed = 0;
+        const failMessages = [];
+        const progress = new import_obsidian.Notice(`Deleting 0/${items.length}...`, 0);
+        for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            const others = await this.findImageReferencesInVault(item.ref, { excludePath: file.path });
+            let scope;
+            if (others.length > 0) {
+                if (sharedChoice === 'skipShared') { skipped++; progress.setMessage(`Deleting ${i + 1}/${items.length}...`); continue; }
+                scope = 'all'; // deleteEverywhere
+            } else {
+                scope = 'all';
+            }
+            const res = await this.executeImageDeletion(item.ref, file, others, token, scope);
+            if (res.status === 'deleted') deleted++;
+            else if (res.status === 'githubFailed' && res.reason === 'rateLimited') {
+                progress.hide();
+                new import_obsidian.Notice(`Stopped: GitHub rate limit reached after ${deleted} deletion(s). Try again later.`, 8000);
+                return;
+            } else {
+                failed++;
+                if (res.message) failMessages.push(`${item.displayName}: ${res.message}`);
+            }
+            progress.setMessage(`Deleting ${i + 1}/${items.length}...`);
+        }
+        progress.hide();
+        let summary = `Deleted ${deleted} image(s).`;
+        if (skipped) summary += ` Skipped ${skipped} still used elsewhere.`;
+        if (failed) summary += ` ${failed} failed.`;
+        new import_obsidian.Notice(summary, failed ? 8000 : 4000);
+        if (failMessages.length) console.error('NotePix: bulk delete failures:', failMessages);
+    }
+
+    // Command entry: present a checklist of this note's images, then bulk-delete.
+    async openMultiDeleteForActiveNote() {
+        const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
+        const file = view?.file;
+        if (!file || !file.path.endsWith('.md')) { new import_obsidian.Notice("Open a markdown note first."); return; }
+        let content;
+        try {
+            content = (view.editor && typeof view.editor.getValue === 'function')
+                ? view.editor.getValue() : await this.app.vault.read(file);
+        } catch (_) { new import_obsidian.Notice("Could not read the note."); return; }
+
+        const items = this.collectManagedImagesInNote(content);
+        if (items.length === 0) { new import_obsidian.Notice("No NotePix images found in this note."); return; }
+        new MultiDeleteModal(this.app, this, file, items).open();
+    }
+
+    // --- Issue #7: find-orphans (report-only) ---
+    // Folders NotePix is configured to manage in the repo. Returns normalized,
+    // slash-free folder prefixes. Reads imageStorageStrategy so it stays correct
+    // when the byNotePath extra is added later (BP-26); today only folderPath.
+    getManagedRepoFolders() {
+        const norm = (p) => String(p || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+        const folders = new Set();
+        const strategy = this.settings.imageStorageStrategy || 'global';
+        if (strategy === 'byNotePath' && this.settings.byNotePathBaseFolder) {
+            folders.add(norm(this.settings.byNotePathBaseFolder));
+        }
+        // Always include the global folder (it's the default upload target).
+        folders.add(norm(this.settings.folderPath || ''));
+        return Array.from(folders).filter(f => f.length > 0);
+    }
+
+    // List image files in the configured repo under the managed folders, with
+    // pagination via the Git Trees API (BP-12). Returns [{ path, owner, repo, branch }].
+    async listRepoImagesUnderFolders(token) {
+        const owner = (this.settings.githubUser || '').trim();
+        const repo = (this.settings.repoName || '').trim();
+        const branch = (this.settings.branchName || 'main').trim();
+        if (!owner || !repo || !token) return { ok: false, reason: 'config', images: [] };
+
+        const folders = this.getManagedRepoFolders();
+        const imageExt = /\.(png|jpe?g|gif|bmp|svg|webp|avif)$/i;
+        // Recursive tree of the branch in one call (GitHub returns up to 100k entries).
+        const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(branch)}?recursive=1`;
+        let response;
+        try {
+            response = await import_obsidian.requestUrl({
+                url, method: 'GET',
+                headers: { "Authorization": `token ${token}`, "Accept": "application/vnd.github.v3+json" },
+                throw: false
+            });
+        } catch (e) {
+            return { ok: false, reason: 'network', images: [] };
+        }
+        const st = response.status;
+        if (st === 403) {
+            const remaining = response.headers && (response.headers['x-ratelimit-remaining'] ?? response.headers['X-RateLimit-Remaining']);
+            return { ok: false, reason: remaining === '0' ? 'rateLimited' : 'forbidden', images: [] };
+        }
+        if (st < 200 || st >= 300) return { ok: false, reason: st === 404 ? 'notFound' : 'error', images: [] };
+        let data;
+        try { data = response.json; } catch (_) { return { ok: false, reason: 'error', images: [] }; }
+        const tree = Array.isArray(data?.tree) ? data.tree : [];
+        const truncated = !!data?.truncated; // BP-12: surface if GitHub capped the listing
+
+        const images = [];
+        for (const entry of tree) {
+            if (entry.type !== 'blob') continue;
+            const path = entry.path || '';
+            if (!imageExt.test(path)) continue;
+            const managed = folders.length === 0 ? true : folders.some(f => path === f || path.startsWith(f + '/'));
+            images.push({ path, owner, repo, branch, managed });
+        }
+        return { ok: true, images, truncated };
+    }
+
+    // Build the set of canonical keys referenced anywhere in the vault (.md + .canvas),
+    // so orphan detection can diff against it (BP-11/17). One pass over all files.
+    async buildReferencedKeySet() {
+        const keys = new Set();
+        const files = this.app.vault.getFiles ? this.app.vault.getFiles() : [];
+        for (const file of files) {
+            const ext = (file.extension || '').toLowerCase();
+            const isMd = ext === 'md';
+            const isCanvas = ext === 'canvas';
+            if (!isMd && !isCanvas) continue;
+            let content;
+            try { content = await this.app.vault.read(file); } catch (_) { continue; }
+            const urls = isCanvas ? this.extractManagedUrlsFromCanvas(content) : this.extractManagedUrlsFromMarkdown(content);
+            for (const url of urls) {
+                const ref = this.canonicalizeImageRef(url);
+                const key = this.canonicalRefKey(ref);
+                if (key) keys.add(key);
+            }
+        }
+        return keys;
+    }
+
+    // Orphan detection (report-only). Returns repo images (managed-scope) whose
+    // canonical key is referenced by NO note/canvas. Never deletes here (BP-11).
+    async computeOrphanImages(token) {
+        const listing = await this.listRepoImagesUnderFolders(token);
+        if (!listing.ok) return { ok: false, reason: listing.reason, orphans: [] };
+        const referenced = await this.buildReferencedKeySet();
+        const orphans = [];
+        for (const img of listing.images) {
+            if (!img.managed) continue; // only propose managed-scope files (BP-26)
+            const key = `${img.owner}/${img.repo}/${img.branch}/${img.path}`;
+            if (!referenced.has(key)) orphans.push(img);
+        }
+        return { ok: true, orphans, truncated: listing.truncated };
+    }
+
+    // Command entry: compute orphans and (live) present them for review. The
+    // computation is unit-tested; the review modal + actual deletion is live.
+    async findOrphanImages() {
+        if (!this.settings.githubUser || !this.settings.repoName) {
+            new import_obsidian.Notice("GitHub User and Repo Name must be configured."); return;
+        }
+        const token = await this.getToken();
+        if (!token) return;
+        const notice = new import_obsidian.Notice("Scanning repository and vault for orphaned images...", 0);
+        let result;
+        try { result = await this.computeOrphanImages(token); }
+        catch (e) { notice.hide(); console.error('NotePix: orphan scan failed', e); new import_obsidian.Notice("Orphan scan failed."); return; }
+        notice.hide();
+        if (!result.ok) {
+            const why = result.reason === 'rateLimited' ? "GitHub rate limit reached — try again later."
+                : result.reason === 'forbidden' ? "Your token can't read the repo tree."
+                : result.reason === 'config' ? "Repository not configured."
+                : `Could not list repo images (${result.reason}).`;
+            new import_obsidian.Notice(why, 7000); return;
+        }
+        if (result.orphans.length === 0) {
+            new import_obsidian.Notice("No orphaned images found — every managed image is still referenced."); return;
+        }
+        // Present for review; OrphanReviewModal handles per-item selection + deletion.
+        new OrphanReviewModal(this.app, this, result.orphans, result.truncated).open();
+    }
+
+    // Delete a user-selected list of orphan images from GitHub, one at a time
+    // (serialized to avoid 409 stale-SHA races — BP-6). Halts the batch on a rate
+    // limit (BP-22). Orphans have no note links to remove (they're unreferenced).
+    async deleteOrphansSequentially(orphans) {
+        const token = await this.getToken();
+        if (!token) return;
+        let deleted = 0, failed = 0;
+        const progress = new import_obsidian.Notice(`Deleting 0/${orphans.length}...`, 0);
+        for (let i = 0; i < orphans.length; i++) {
+            const o = orphans[i];
+            const res = await this.deleteFileFromGitHub(o.owner, o.repo, o.branch, o.path, token);
+            if (res.ok || res.reason === 'notFound') {
+                deleted++;
+            } else {
+                failed++;
+                if (res.reason === 'rateLimited') {
+                    progress.hide();
+                    new import_obsidian.Notice(`Stopped: GitHub rate limit reached after ${deleted} deletion(s). Try again later.`, 8000);
+                    return;
+                }
+            }
+            progress.setMessage(`Deleting ${i + 1}/${orphans.length}...`);
+        }
+        progress.hide();
+        new import_obsidian.Notice(failed > 0
+            ? `Deleted ${deleted} orphan(s), ${failed} failed.`
+            : `Deleted ${deleted} orphaned image(s) from GitHub.`);
+    }
+
+    // --- Optional extra: convert image link FORMAT in note text ---
+    // Rewrites managed image embeds in `content` to `targetFormat`:
+    //   'cdn' -> jsDelivr CDN  | 'raw' -> raw.githubusercontent
+    // Only converts between PUBLIC formats (raw <-> cdn). Private v2 links and
+    // legacy links are left untouched (CDN/raw can't serve private repos).
+    // Preserves the embed's alt text. Pure function → unit-testable.
+    // Returns { text, converted } (converted = count).
+    convertLinkFormatsInText(content, targetFormat) {
+        if (!content) return { text: content, converted: 0 };
+        const embeds = this.parseImageEmbeds(content);
+        const edits = []; // { from, to, replacement }
+        for (const e of embeds) {
+            if (e.isWiki) continue;
+            const ref = this.canonicalizeImageRef(e.urlRaw);
+            if (!ref || ref.ambiguous) continue;
+            // Only raw<->cdn are convertible public formats.
+            if (ref.kind !== 'raw' && ref.kind !== 'cdn') continue;
+            if (ref.kind === targetFormat) continue; // already in target format
+            const encPath = ref.path.split('/').map(encodeURIComponent).join('/');
+            let newUrl;
+            if (targetFormat === 'cdn') {
+                newUrl = `https://cdn.jsdelivr.net/gh/${ref.owner}/${ref.repo}@${ref.branch}/${encPath}`;
+            } else if (targetFormat === 'raw') {
+                newUrl = `https://raw.githubusercontent.com/${ref.owner}/${ref.repo}/${ref.branch}/${encPath}`;
+            } else {
+                continue;
+            }
+            edits.push({ from: e.from, to: e.to, replacement: `![${e.altRaw || ''}](${newUrl})` });
+        }
+        if (edits.length === 0) return { text: content, converted: 0 };
+        edits.sort((a, b) => b.from - a.from); // apply back-to-front
+        let out = content;
+        for (const ed of edits) out = out.slice(0, ed.from) + ed.replacement + out.slice(ed.to);
+        return { text: out, converted: edits.length };
+    }
+
+    // Command entry: convert all managed image links in the active note to a
+    // chosen public format. Atomic write (BP-8). Refuses CDN target for a
+    // private/auto-private repo (jsDelivr can't serve private repos).
+    async convertNoteLinkFormat(file, targetFormat) {
+        if (!(file instanceof import_obsidian.TFile) || !file.path.endsWith('.md')) {
+            new import_obsidian.Notice("Open a markdown note first."); return;
+        }
+        if (targetFormat === 'cdn') {
+            const privacy = await this.getRepoPrivacy();
+            if (privacy === 'private') {
+                new import_obsidian.Notice("This repo is private — jsDelivr CDN can't serve private repos. Conversion to CDN cancelled.", 7000);
+                return;
+            }
+        }
+        let count = 0;
+        try {
+            if (typeof this.app.vault.process === 'function') {
+                await this.app.vault.process(file, (data) => {
+                    const r = this.convertLinkFormatsInText(data, targetFormat);
+                    count = r.converted;
+                    return r.text;
+                });
+            } else {
+                const data = await this.app.vault.read(file);
+                const r = this.convertLinkFormatsInText(data, targetFormat);
+                count = r.converted;
+                if (count > 0) await this.app.vault.modify(file, r.text);
+            }
+        } catch (e) {
+            console.error("NotePix: convert link format failed", e);
+            new import_obsidian.Notice("Could not convert links."); return;
+        }
+        new import_obsidian.Notice(count > 0
+            ? `Converted ${count} image link(s) to ${targetFormat === 'cdn' ? 'jsDelivr CDN' : 'GitHub raw'}.`
+            : "No convertible public image links found in this note.");
+    }
+
+    // Compute character ranges covered by fenced (``` ```) or indented code
+    // blocks so v2 links shown as example text are not rendered as images.
+    getCodeBlockRanges(docText) {
+        const ranges = [];
+        if (!docText) return ranges;
+        const lines = docText.split('\n');
+        let offset = 0;
+        let fenceOpen = null; // { marker, start }
+        for (const line of lines) {
+            const lineStart = offset;
+            const lineEnd = offset + line.length;
+            const fenceMatch = line.match(/^\s*(```+|~~~+)/);
+            if (fenceOpen) {
+                if (fenceMatch && line.trim().startsWith(fenceOpen.marker[0])) {
+                    ranges.push({ from: fenceOpen.start, to: lineEnd });
+                    fenceOpen = null;
+                }
+            } else if (fenceMatch) {
+                fenceOpen = { marker: fenceMatch[1], start: lineStart };
+            }
+            offset = lineEnd + 1; // account for the '\n'
+        }
+        if (fenceOpen) ranges.push({ from: fenceOpen.start, to: docText.length });
+        return ranges;
+    }
+
+    // Find every notepix-v2 image embed in a document string. Returns occurrences
+    // with absolute char offsets (from parseImageEmbeds) so the editor extension
+    // can place widgets at the EXACT span — never via indexOf, which would
+    // collapse duplicate identical links onto one range and overlap-crash CM6.
+    //   { source, from, to, target }   where target is parseNotepixV2Target output.
+    findNotepixV2Embeds(docText) {
+        const out = [];
+        const codeRanges = this.getCodeBlockRanges(docText);
+        const inCode = (from, to) => codeRanges.some(r => from < r.to && to > r.from);
+        for (const embed of this.parseImageEmbeds(docText)) {
+            if (embed.isWiki) continue; // wikilinks can't carry an obsidian:// URL
+            const target = this.parseNotepixV2Target(embed.urlRaw, embed.altRaw);
+            if (!target) continue;
+            if (inCode(embed.from, embed.to)) continue; // skip code-block examples
+            out.push({ source: embed.source, from: embed.from, to: embed.to, target });
+        }
+        return out;
+    }
+
+    // Patch any notepix <img> elements inside a container by swapping their
+    // obsidian://notepix/... src for a fetched blob URL. Reuses the SAME engine
+    // as Reading View (resolveNotepixBlobUrl + imageCache). This is the approach
+    // that works: instead of fighting Obsidian's native Live Preview embed
+    // rendering with a replace-widget, we let Obsidian create the <img> and just
+    // fix its src — exactly like postProcessImages does for Reading View.
+    patchNotepixImagesIn(containerEl) {
+        if (!containerEl || typeof containerEl.querySelectorAll !== 'function') return;
+        const imgs = Array.from(containerEl.querySelectorAll('img'));
+        const token = this.getRenderTokenNoPrompt();
+        for (const img of imgs) {
+            const src = img.getAttribute('src') || '';
+
+            // Case 1: private notepix link → fetch bytes + swap src (needs token).
+            if (src.startsWith('obsidian://notepix/')) {
+                if (img.dataset && img.dataset.notepixPatched === '1') continue;
+                if (!token) continue; // encrypted+locked → skip silently (no prompt)
+                const after = src.substring('obsidian://notepix/'.length);
+                let owner, repo, branch, path;
+                if (after.startsWith('v2/')) {
+                    const parts = after.substring(3).split('/');
+                    if (parts.length < 4) continue;
+                    const dec = (v) => { try { return decodeURIComponent(v); } catch (_) { return v; } };
+                    owner = dec(parts[0]); repo = dec(parts[1]); branch = dec(parts[2]);
+                    path = parts.slice(3).map(dec).join('/');
+                } else {
+                    owner = (this.settings.githubUser || '').trim();
+                    repo = (this.settings.repoName || '').trim();
+                    branch = (this.settings.branchName || 'main').trim();
+                    try { path = decodeURIComponent(after); } catch (_) { path = after; }
+                }
+                if (img.dataset) img.dataset.notepixPatched = '1';
+                // Keep the original link so right-click can delete it after src swap.
+                this.attachImageContextMenu(img, src);
+                this.resolveNotepixBlobUrl(owner, repo, branch, path, token)
+                    .then((url) => { if (url) img.src = url; })
+                    .catch(() => { /* leave broken img on failure */ });
+                continue;
+            }
+
+            // Case 2: public raw/CDN image owned by us → don't touch src (it renders
+            // natively), but attach our menu so Copy image / Copy URL / Delete work.
+            if (src.startsWith('https://raw.githubusercontent.com/') || src.startsWith('https://cdn.jsdelivr.net/gh/')) {
+                if (img.dataset && img.dataset.notepixMenu === '1') continue;
+                const ref = this.canonicalizeImageRef(src);
+                if (!ref || ref.ambiguous) continue; // not a NotePix-managed image
+                this.attachImageContextMenu(img, src);
+            }
+        }
+    }
+
+    // Compute the public URL to offer under "Copy URL" for a canonical ref, or
+    // null when the image isn't publicly usable (private repo → the URL wouldn't
+    // load for anyone). Matches the note's format: CDN if enabled, else raw.
+    // Uses the CACHED repo privacy only (never prompts / never network here).
+    publicUrlForRef(ref) {
+        if (!ref || ref.ambiguous) return null;
+        // A v2 link is private-by-definition → no shareable public URL.
+        if (ref.kind === 'v2' || ref.kind === 'legacy') return null;
+        // For raw/cdn links, only offer if the repo is known-public. Use cached
+        // privacy; if unknown, be safe and hide (avoid handing out a dead URL).
+        const cache = this.repoPrivacyCache;
+        const sameRepo = cache && cache.user === (this.settings.githubUser || '').trim()
+            && cache.repo === (this.settings.repoName || '').trim();
+        const privacy = sameRepo ? cache.value : 'unknown';
+        // If the link points at the configured repo, only offer when it's known
+        // PUBLIC. Private → hide (URL won't load); unknown → hide (be safe, don't
+        // hand out a possibly-dead URL). Links to OTHER repos are assumed public
+        // (they rendered natively as a plain <img>, which only works if public).
+        const isConfiguredRepo = ref.owner === (this.settings.githubUser || '').trim()
+            && ref.repo === (this.settings.repoName || '').trim();
+        if (isConfiguredRepo && privacy !== 'public') return null;
+        // Build the URL in the note's preferred format.
+        const encPath = ref.path.split('/').map(encodeURIComponent).join('/');
+        if (this.settings.useCdn) {
+            return `https://cdn.jsdelivr.net/gh/${ref.owner}/${ref.repo}@${ref.branch}/${encPath}`;
+        }
+        return `https://raw.githubusercontent.com/${ref.owner}/${ref.repo}/${ref.branch}/${encPath}`;
+    }
+
+    // Attach a right-click menu to a rendered NotePix <img>. Obsidian gives no
+    // public way to APPEND to its native image menu (editor-menu doesn't fire for
+    // a rendered image widget), so we show our own menu that reproduces the useful
+    // actions: Copy image (always), Copy URL (public/CDN only — hidden for private
+    // repos, whose URLs wouldn't load for anyone), and Delete.
+    attachImageContextMenu(img, originalUrl) {
+        if (!img || img.dataset?.notepixMenu === '1') return;
+        if (img.dataset) img.dataset.notepixMenu = '1';
+        img.addEventListener('contextmenu', (evt) => {
+            let ref = this.canonicalizeImageRef(originalUrl);
+            if (ref && ref.ambiguous) {
+                const legacyRepo = this.legacyResolvedRepoByKey
+                    ? this.legacyResolvedRepoByKey.get(`${ref.owner}|${ref.branch}|${ref.path}`) : null;
+                if (legacyRepo) ref = this.canonicalizeImageRef(originalUrl, legacyRepo);
+            }
+            if (!ref) return; // not a managed image → let Obsidian's own menu show
+            evt.preventDefault();
+            evt.stopPropagation();
+            const menu = new import_obsidian.Menu();
+            // Copy image — reproduce the native action so it isn't lost.
+            menu.addItem((item) => {
+                item.setTitle("Copy image")
+                    .setIcon("image")
+                    .onClick(() => this.copyImageToClipboard(img, ref));
+            });
+            // Copy URL — only when the image is publicly reachable.
+            const publicUrl = this.publicUrlForRef(ref);
+            if (publicUrl) {
+                menu.addItem((item) => {
+                    item.setTitle("Copy URL")
+                        .setIcon("link")
+                        .onClick(async () => {
+                            try { await navigator.clipboard.writeText(publicUrl); new import_obsidian.Notice("Image URL copied."); }
+                            catch (_) { new import_obsidian.Notice("Could not copy URL."); }
+                        });
+                });
+            }
+            menu.addSeparator?.();
+            menu.addItem((item) => {
+                item.setTitle("NotePix: Delete image (GitHub + note)")
+                    .setIcon("trash")
+                    .onClick(() => this.deleteImageByRef(ref, null));
+            });
+            menu.showAtMouseEvent(evt);
+        });
+    }
+
+    // Fetch the real image BYTES for a canonical ref, reusing the same auth path
+    // as rendering. Returns { arrayBuffer, contentType } or null. Works for both
+    // private (needs token) and public repos (token optional but fine to send).
+    async fetchImageBytes(ref) {
+        if (!ref || ref.ambiguous) return null;
+        const token = this.getRenderTokenNoPrompt() || (await this.getToken().catch(() => null));
+        if (!token) return null;
+        const encSeg = ref.path.split('/').map(encodeURIComponent).join('/');
+        const url = `https://api.github.com/repos/${encodeURIComponent(ref.owner)}/${encodeURIComponent(ref.repo)}/contents/${encSeg}?ref=${encodeURIComponent(ref.branch)}`;
+        try {
+            const resp = await import_obsidian.requestUrl({
+                url, method: 'GET',
+                headers: { "Authorization": `token ${token}`, "Accept": "application/vnd.github.v3.raw" },
+                throw: false
+            });
+            if (resp.status < 200 || resp.status >= 300) return null;
+            if (!resp.arrayBuffer) return null;
+            // Guess content type from extension (GitHub raw doesn't always set it).
+            const ext = (ref.path.split('.').pop() || '').toLowerCase();
+            const contentType = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
+                : ext === 'gif' ? 'image/gif' : ext === 'webp' ? 'image/webp'
+                : ext === 'svg' ? 'image/svg+xml' : ext === 'bmp' ? 'image/bmp' : 'image/png';
+            return { arrayBuffer: resp.arrayBuffer, contentType };
+        } catch (_) { return null; }
+    }
+
+    // Copy the actual image (bytes) to the clipboard — NOT the URL. Prefers
+    // Electron's native clipboard.writeImage (handles cross-origin bytes cleanly
+    // on desktop), then the Web ClipboardItem API. Only falls back to URL text as
+    // a last resort, and says so explicitly.
+    async copyImageToClipboard(img, ref) {
+        const data = await this.fetchImageBytes(ref);
+        // 1) Electron native clipboard (desktop) — most reliable for real bytes.
+        try {
+            if (data && !isMobile) {
+                const electron = window.require ? window.require('electron') : null;
+                const nativeImage = electron?.nativeImage;
+                const clipboard = electron?.clipboard;
+                if (nativeImage && clipboard) {
+                    const buf = Buffer.from(new Uint8Array(data.arrayBuffer));
+                    const image = nativeImage.createFromBuffer(buf);
+                    if (image && !image.isEmpty()) {
+                        clipboard.writeImage(image);
+                        new import_obsidian.Notice("Image copied to clipboard.");
+                        return;
+                    }
+                }
+            }
+        } catch (_) { /* fall through to web API */ }
+
+        // 2) Web Clipboard API with the real bytes (works when ClipboardItem exists).
+        try {
+            if (data && navigator.clipboard && window.ClipboardItem) {
+                // PNG is the most broadly-accepted type for image clipboard writes.
+                const type = data.contentType === 'image/png' ? 'image/png' : data.contentType;
+                const blob = new Blob([data.arrayBuffer], { type });
+                await navigator.clipboard.write([new window.ClipboardItem({ [type]: blob })]);
+                new import_obsidian.Notice("Image copied to clipboard.");
+                return;
+            }
+        } catch (_) { /* fall through */ }
+
+        // 3) Canvas from the already-rendered <img> (works for blob: srcs).
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = img.naturalWidth || img.width;
+            canvas.height = img.naturalHeight || img.height;
+            if (canvas.width && canvas.height) {
+                canvas.getContext('2d').drawImage(img, 0, 0);
+                const blob = await new Promise((res) => canvas.toBlob(res, 'image/png'));
+                if (blob && navigator.clipboard && window.ClipboardItem) {
+                    await navigator.clipboard.write([new window.ClipboardItem({ 'image/png': blob })]);
+                    new import_obsidian.Notice("Image copied to clipboard.");
+                    return;
+                }
+            }
+        } catch (_) { /* fall through */ }
+
+        new import_obsidian.Notice("Could not copy the image bytes on this platform.", 6000);
+    }
+
+    // Build the Live-Preview editor extension. Returns null when CM6 view classes
+    // are unavailable (older/unsupported environments); Reading View still works.
+    // Strategy: a ViewPlugin that, whenever the editor updates, patches the src of
+    // any obsidian://notepix images Obsidian rendered — plus a MutationObserver to
+    // catch images added asynchronously as you scroll/type.
+    buildLivePreviewExtension() {
+        if (!cm6View || !cm6View.ViewPlugin) {
+            return null;
+        }
+        const plugin = this;
+        const { ViewPlugin } = cm6View;
+
+        return ViewPlugin.fromClass(
+            class {
+                constructor(view) {
+                    this.view = view;
+                    // Patch what's already there.
+                    plugin.patchNotepixImagesIn(view.dom);
+                    // Watch for late-added images (scroll, live edits).
+                    this.observer = new MutationObserver(() => {
+                        plugin.patchNotepixImagesIn(view.dom);
+                    });
+                    this.observer.observe(view.dom, { childList: true, subtree: true });
+                }
+                update(u) {
+                    if (u.docChanged || u.viewportChanged) {
+                        plugin.patchNotepixImagesIn(u.view.dom);
+                    }
+                }
+                destroy() {
+                    if (this.observer) { this.observer.disconnect(); this.observer = null; }
+                }
+            }
+        );
     }
 
     async postProcessImages(element, context) {
@@ -1865,6 +3734,48 @@ var GitHubUploaderSettingTab = class extends import_obsidian.PluginSettingTab {
         }));
 
         new import_obsidian.Setting(containerEl)
+            .setName("Use jsDelivr CDN for public images")
+            .setDesc("Optional. When ON and the repository is public, new uploads use fast cached CDN links (cdn.jsdelivr.net) instead of raw GitHub links. Automatically ignored for private repos — jsDelivr cannot serve private repositories. Use the 'Convert image links' commands to migrate existing notes.")
+            .addToggle((toggle) => toggle.setValue(this.plugin.settings.useCdn).onChange(async (value) => {
+                this.plugin.settings.useCdn = value;
+                await this.plugin.saveSettings();
+            }));
+
+        new import_obsidian.Setting(containerEl)
+            .setName("Image storage layout in repository")
+            .setDesc("Optional. 'Global folder' stores all images in the folder path above. 'Mirror note path' stores each note's images in a repo folder matching the note's location (folder/note name), under the base folder below. Only affects NEW uploads.")
+            .addDropdown(dropdown => dropdown
+                .addOption('global', 'Global folder (default)')
+                .addOption('byNotePath', 'Mirror note path')
+                .setValue(this.plugin.settings.imageStorageStrategy || 'global')
+                .onChange(async (value) => {
+                    this.plugin.settings.imageStorageStrategy = value;
+                    await this.plugin.saveSettings();
+                    this.display(); // re-render to show/hide the base-folder field
+                }));
+
+        if ((this.plugin.settings.imageStorageStrategy || 'global') === 'byNotePath') {
+            new import_obsidian.Setting(containerEl)
+                .setName("Base folder for note-path layout")
+                .setDesc("Repository folder under which the mirrored note paths are created (e.g. 'assets' → assets/Projects/My-Note/...). Note/folder names are sanitized to safe characters.")
+                .addText((text) => text
+                    .setPlaceholder("assets")
+                    .setValue(this.plugin.settings.byNotePathBaseFolder || 'assets')
+                    .onChange(async (value) => {
+                        this.plugin.settings.byNotePathBaseFolder = value;
+                        await this.plugin.saveSettings();
+                    }));
+        }
+
+        new import_obsidian.Setting(containerEl)
+            .setName("Name images after the note / heading")
+            .setDesc("Optional. When ON, a pasted image is named after the note (e.g. 'MyNote-1.png'), or 'Note-Heading-1.png' when pasted under a heading, instead of a timestamp. Readable and stable across reorders.")
+            .addToggle((toggle) => toggle.setValue(this.plugin.settings.headingBasedNaming).onChange(async (value) => {
+                this.plugin.settings.headingBasedNaming = value;
+                await this.plugin.saveSettings();
+            }));
+
+        new import_obsidian.Setting(containerEl)
             .setName("Pasted image upload behavior")
             .setDesc("Choose whether to upload pasted images automatically or to be asked each time.")
             .addDropdown(dropdown => dropdown
@@ -2461,6 +4372,260 @@ var RepoMismatchModal = class extends import_obsidian.Modal {
         if (this.resolve) this.resolve(this.choice);
     }
 }
+
+// --- Issue #7: delete confirmation modal (image used nowhere else) ---
+// Resolves to true (delete) or false (cancel). States irreversibility plainly.
+var DeleteImageModal = class extends import_obsidian.Modal {
+    constructor(app, refLabel) {
+        super(app);
+        this.refLabel = refLabel;
+        this.confirmed = false;
+    }
+    openAndWait() {
+        return new Promise((resolve) => { this.resolve = resolve; super.open(); });
+    }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.createEl("h2", { text: "Delete image from GitHub?" });
+        contentEl.createEl("p", { text: `This will permanently delete the file from GitHub and remove its link from this note:` });
+        const code = contentEl.createEl("p", { text: this.refLabel });
+        code.style.fontFamily = 'var(--font-monospace)';
+        code.style.wordBreak = 'break-all';
+        code.style.opacity = '0.8';
+        const warn = contentEl.createEl("p", { text: "⚠️ This cannot be undone." });
+        warn.style.color = 'var(--text-error)';
+        new import_obsidian.Setting(contentEl)
+            .addButton(btn => btn.setButtonText("Cancel").onClick(() => { this.confirmed = false; this.close(); }))
+            .addButton(btn => btn.setButtonText("Delete").setWarning().onClick(() => { this.confirmed = true; this.close(); }));
+    }
+    onClose() { if (this.resolve) this.resolve(this.confirmed); }
+};
+
+// --- Issue #7: multi-note delete modal (image used in OTHER notes/canvases) ---
+// Shows every other location, then offers three explicit choices. Resolves to:
+//   'cancel' | 'thisOnly' | 'all'
+//   - thisOnly: unlink here, KEEP the GitHub file + other references
+//   - all: delete from GitHub + remove from this note AND all other locations
+var MultiNoteDeleteModal = class extends import_obsidian.Modal {
+    constructor(app, refLabel, otherLocations) {
+        super(app);
+        this.refLabel = refLabel;
+        this.otherLocations = otherLocations || [];
+        this.choice = 'cancel';
+    }
+    openAndWait() {
+        return new Promise((resolve) => { this.resolve = resolve; super.open(); });
+    }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.createEl("h2", { text: "Image is used in other places" });
+        const code = contentEl.createEl("p", { text: this.refLabel });
+        code.style.fontFamily = 'var(--font-monospace)';
+        code.style.wordBreak = 'break-all';
+        code.style.opacity = '0.8';
+        contentEl.createEl("p", { text: `This image is also referenced in ${this.otherLocations.length} other place(s):` });
+        const list = contentEl.createEl("ul");
+        list.style.maxHeight = '160px';
+        list.style.overflowY = 'auto';
+        for (const loc of this.otherLocations) {
+            const label = loc.count > 1 ? `${loc.path} (${loc.count}×)` : loc.path;
+            list.createEl("li", { text: `${loc.kind === 'canvas' ? '🗺️ ' : '📄 '}${label}` });
+        }
+
+        const buttons = contentEl.createDiv();
+        buttons.style.display = 'flex';
+        buttons.style.flexDirection = 'column';
+        buttons.style.gap = '8px';
+        buttons.style.marginTop = '12px';
+        const makeBtn = (text, desc, choice, warning) => {
+            const wrap = buttons.createDiv();
+            const btn = wrap.createEl('button', { text });
+            btn.style.width = '100%';
+            btn.style.textAlign = 'left';
+            btn.style.padding = '8px 12px';
+            if (warning) btn.addClass('mod-warning');
+            const d = wrap.createEl('small', { text: desc });
+            d.style.display = 'block';
+            d.style.opacity = '0.7';
+            d.style.marginLeft = '12px';
+            btn.onclick = () => { this.choice = choice; this.close(); };
+        };
+        makeBtn("Remove only this link", "Unlink it here. Keeps the GitHub file and the other references intact.", "thisOnly", false);
+        makeBtn("Remove from everywhere + GitHub", "Deletes the GitHub file and removes the link from this note and all other locations. Cannot be undone.", "all", true);
+        makeBtn("Cancel", "Do nothing.", "cancel", false);
+    }
+    onClose() { if (this.resolve) this.resolve(this.choice); }
+};
+
+// --- Issue #7: orphan review modal (report-only; user ticks what to delete) ---
+// Never auto-deletes (BP-11). Each orphan has a checkbox (default UNchecked).
+// Deletion runs sequentially through the plugin's GitHub delete engine.
+var OrphanReviewModal = class extends import_obsidian.Modal {
+    constructor(app, plugin, orphans, truncated) {
+        super(app);
+        this.plugin = plugin;
+        this.orphans = orphans || [];
+        this.truncated = !!truncated;
+        this.checked = new Set();
+    }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.createEl("h2", { text: "Orphaned images on GitHub" });
+        contentEl.createEl("p", { text: `${this.orphans.length} image(s) are not referenced by any note or canvas. Select the ones to permanently delete from GitHub.` });
+        if (this.truncated) {
+            const t = contentEl.createEl("p", { text: "⚠️ The repository file list was very large and may be incomplete." });
+            t.style.color = 'var(--text-warning)';
+        }
+        const warn = contentEl.createEl("p", { text: "⚠️ Deletion cannot be undone." });
+        warn.style.color = 'var(--text-error)';
+
+        const listEl = contentEl.createDiv();
+        listEl.style.maxHeight = '300px';
+        listEl.style.overflowY = 'auto';
+        listEl.style.margin = '8px 0';
+        for (const orphan of this.orphans) {
+            const row = listEl.createDiv();
+            row.style.display = 'flex';
+            row.style.alignItems = 'center';
+            row.style.gap = '8px';
+            row.style.padding = '2px 0';
+            const cb = row.createEl('input');
+            cb.type = 'checkbox';
+            cb.onchange = () => { if (cb.checked) this.checked.add(orphan); else this.checked.delete(orphan); };
+            const label = row.createEl('span', { text: orphan.path });
+            label.style.fontFamily = 'var(--font-monospace)';
+            label.style.fontSize = '0.85em';
+            label.style.wordBreak = 'break-all';
+        }
+
+        new import_obsidian.Setting(contentEl)
+            .addButton(btn => btn.setButtonText("Cancel").onClick(() => this.close()))
+            .addButton(btn => btn.setButtonText("Delete selected").setWarning().onClick(async () => {
+                const toDelete = Array.from(this.checked);
+                if (toDelete.length === 0) { new import_obsidian.Notice("Nothing selected."); return; }
+                this.close();
+                await this.plugin.deleteOrphansSequentially(toDelete);
+            }));
+    }
+    onClose() { this.contentEl.empty(); }
+};
+
+// --- Issue #7: multi-select delete modal (checklist of a note's images) ---
+// Lists distinct managed images with checkboxes (default UNchecked). On confirm,
+// if any selected image is used in OTHER notes, asks once how to handle shared
+// ones (skip vs delete-everywhere), then runs the bulk delete.
+var MultiDeleteModal = class extends import_obsidian.Modal {
+    constructor(app, plugin, file, items) {
+        super(app);
+        this.plugin = plugin;
+        this.file = file;
+        this.items = items || [];
+        this.checked = new Set();
+    }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.createEl("h2", { text: "Delete images in this note" });
+        contentEl.createEl("p", { text: `${this.items.length} image(s) in this note. Select the ones to delete from GitHub and remove from the note.` });
+        const warn = contentEl.createEl("p", { text: "⚠️ Deletion cannot be undone." });
+        warn.style.color = 'var(--text-error)';
+
+        const listEl = contentEl.createDiv();
+        listEl.style.maxHeight = '300px';
+        listEl.style.overflowY = 'auto';
+        listEl.style.margin = '8px 0';
+        const checkboxes = [];
+        for (const item of this.items) {
+            const row = listEl.createDiv();
+            row.style.display = 'flex';
+            row.style.alignItems = 'center';
+            row.style.gap = '8px';
+            row.style.padding = '3px 0';
+            const cb = row.createEl('input');
+            cb.type = 'checkbox';
+            cb.onchange = () => { if (cb.checked) this.checked.add(item); else this.checked.delete(item); };
+            checkboxes.push({ cb, item });
+            const label = row.createEl('span', { text: item.count > 1 ? `${item.displayName} (${item.count}× in note)` : item.displayName });
+            label.style.fontSize = '0.9em';
+            label.style.wordBreak = 'break-all';
+        }
+
+        // Select-all / none toggle.
+        const selAll = new import_obsidian.Setting(contentEl).setName("Select all");
+        selAll.addToggle(t => t.setValue(false).onChange(v => {
+            this.checked = new Set();
+            for (const { cb, item } of checkboxes) { cb.checked = v; if (v) this.checked.add(item); }
+        }));
+
+        new import_obsidian.Setting(contentEl)
+            .addButton(btn => btn.setButtonText("Cancel").onClick(() => this.close()))
+            .addButton(btn => btn.setButtonText("Delete selected").setWarning().onClick(async () => {
+                const selected = Array.from(this.checked);
+                if (selected.length === 0) { new import_obsidian.Notice("Nothing selected."); return; }
+                this.close();
+                await this._runDelete(selected);
+            }));
+    }
+    async _runDelete(selected) {
+        const token = await this.plugin.getToken();
+        if (!token) return;
+        // Multi-note guard, decided ONCE for the whole batch.
+        const shared = [];
+        for (const item of selected) {
+            const others = await this.plugin.findImageReferencesInVault(item.ref, { excludePath: this.file.path });
+            if (others.length > 0) shared.push({ item, others });
+        }
+        let sharedChoice = 'deleteEverywhere';
+        if (shared.length > 0) {
+            sharedChoice = await new BulkSharedChoiceModal(this.app, shared).openAndWait();
+            if (sharedChoice === 'cancel') return;
+        }
+        await this.plugin.bulkDeleteImages(this.file, selected, token, sharedChoice);
+    }
+    onClose() { this.contentEl.empty(); }
+};
+
+// Asked once when a bulk delete includes images used in other notes/canvases.
+// Resolves to 'skipShared' | 'deleteEverywhere' | 'cancel'.
+var BulkSharedChoiceModal = class extends import_obsidian.Modal {
+    constructor(app, shared) {
+        super(app);
+        this.shared = shared || [];
+        this.choice = 'cancel';
+    }
+    openAndWait() {
+        return new Promise((resolve) => { this.resolve = resolve; super.open(); });
+    }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.createEl("h2", { text: "Some images are used elsewhere" });
+        contentEl.createEl("p", { text: `${this.shared.length} of the selected image(s) are also referenced in other notes or canvases:` });
+        const list = contentEl.createEl("ul");
+        list.style.maxHeight = '150px';
+        list.style.overflowY = 'auto';
+        for (const s of this.shared) {
+            const where = s.others.map(o => o.path).join(', ');
+            list.createEl("li", { text: `${s.item.displayName} — also in: ${where}` });
+        }
+        const buttons = contentEl.createDiv();
+        buttons.style.display = 'flex';
+        buttons.style.flexDirection = 'column';
+        buttons.style.gap = '8px';
+        buttons.style.marginTop = '12px';
+        const makeBtn = (text, desc, choice, warning) => {
+            const wrap = buttons.createDiv();
+            const btn = wrap.createEl('button', { text });
+            btn.style.width = '100%'; btn.style.textAlign = 'left'; btn.style.padding = '8px 12px';
+            if (warning) btn.addClass('mod-warning');
+            const d = wrap.createEl('small', { text: desc });
+            d.style.display = 'block'; d.style.opacity = '0.7'; d.style.marginLeft = '12px';
+            btn.onclick = () => { this.choice = choice; this.close(); };
+        };
+        makeBtn("Skip shared images", "Delete only the images used nowhere else. Keeps the shared ones (and other notes) intact.", "skipShared", false);
+        makeBtn("Delete everywhere + GitHub", "Delete the GitHub files and remove these links from ALL notes/canvases. Cannot be undone.", "deleteEverywhere", true);
+        makeBtn("Cancel", "Do nothing.", "cancel", false);
+    }
+    onClose() { if (this.resolve) this.resolve(this.choice); }
+};
 
 module.exports = MyPlugin;
 
