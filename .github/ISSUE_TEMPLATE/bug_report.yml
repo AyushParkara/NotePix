@@ -1,0 +1,78 @@
+name: 🐞 Bug report
+description: Report unexpected behavior, an error, or something broken in NotePix.
+title: "[BUG] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! Please fill in the details below so it can be
+        reproduced and fixed quickly. **Do not paste your GitHub token or password anywhere.**
+  - type: input
+    id: plugin-version
+    attributes:
+      label: NotePix version
+      placeholder: "e.g. 1.5.0"
+    validations:
+      required: true
+  - type: input
+    id: obsidian-version
+    attributes:
+      label: Obsidian version
+      placeholder: "e.g. 1.6.7"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Windows (desktop)
+        - macOS (desktop)
+        - Linux (desktop)
+        - Android (mobile)
+        - iOS / iPadOS (mobile)
+    validations:
+      required: true
+  - type: dropdown
+    id: repo-visibility
+    attributes:
+      label: Repository visibility mode
+      options:
+        - Auto
+        - Public
+        - Private
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: A clear and concise description of what went wrong.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      value: |
+        1. Go to '...'
+        2. Click on '...'
+        3. See error
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Console logs / screenshots
+      description: >
+        Open the developer console (Ctrl/Cmd+Shift+I) and paste any `NotePix:` errors.
+        Screenshots help too. **Redact any tokens.**
+    validations:
+      required: false

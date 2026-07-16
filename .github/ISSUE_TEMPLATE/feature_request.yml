@@ -1,0 +1,37 @@
+name: ✨ Feature request
+description: Suggest a new feature or an improvement to NotePix.
+title: "[FEAT] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! The more concrete the use case, the more likely it gets built.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Is your request related to a problem or limitation you've hit?
+      placeholder: "I'm always frustrated when..."
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Describe the solution you'd like
+      description: What should NotePix do? Mention any specific commands or settings you envision.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Screenshots, examples, or links to how other tools do it.
+    validations:
+      required: false
