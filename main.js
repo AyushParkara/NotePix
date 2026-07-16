@@ -135,7 +135,17 @@ var DEFAULT_SETTINGS = {
     //   never renames anything (no destructive renumber needed).
     headingBasedNaming: false,
     // Persisted per-(note|heading) running counters for headingBasedNaming.
-    imageCounters: {}
+    imageCounters: {},
+    // --- Optional extra: "Portable local folders" (off by default) ---
+    // For notes INSIDE a designated main folder, pasted images stay LOCAL (never
+    // uploaded), are named with the note/heading convention, stored in a
+    // "<mainFolder>/<photos>" subfolder, and linked with a RELATIVE path so the
+    // whole folder can be moved without breaking image links. Separate from the
+    // localOnly* system (different trigger: note-location, not file-location).
+    portableLocalEnabled: false,          // master toggle; when false, no UI + inert
+    portableLocalList: [],                // [{ path, label? }] designated main folders
+    portablePhotosSubfolder: 'photos',    // subfolder name created inside each main folder
+    portableLinkFormat: 'relative'        // 'relative' -> ![](photos/x.png) | 'wikilink' -> ![[x.png]]
 };
 var MyPlugin = class extends import_obsidian.Plugin {
     constructor() {
@@ -179,6 +189,49 @@ var MyPlugin = class extends import_obsidian.Plugin {
     normalizeVaultPath(path) {
         return (path || '').replace(/\\\\/g, "/").replace(/^\/+|\/+$/g, "");
     }
+
+    // --- Portable local folders helpers ---
+    // Return the designated main folder (normalized) that a note lives inside, or
+    // null. A note at "F/..." matches folder "F" (prefix + "/"), so "Reports"
+    // matches "Reports/a.md" and "Reports/sub/b.md" but NOT "Reports-2023/c.md".
+    // If a note is inside several designated folders (nested), the MOST SPECIFIC
+    // (longest path) wins.
+    getPortableMainFolderForNote(notePath) {
+        if (!this.settings.portableLocalEnabled) return null;
+        const note = this.normalizeVaultPath(notePath);
+        if (!note) return null;
+        const list = Array.isArray(this.settings.portableLocalList) ? this.settings.portableLocalList : [];
+        let best = null;
+        for (const entry of list) {
+            const raw = (entry && (entry.path || entry)) || '';
+            const folder = this.normalizeVaultPath(raw);
+            if (!folder) continue;
+            if (note === folder || note.startsWith(folder + '/')) {
+                if (!best || folder.length > best.length) best = folder;
+            }
+        }
+        return best; // normalized folder path, or null
+    }
+
+    // Compute a POSIX relative link from a note to an image file (both are
+    // vault-relative, normalized). e.g. note "R/a.md", image "R/photos/a-1.png"
+    // -> "photos/a-1.png"; note "R/sub/a.md" -> "../photos/a-1.png".
+    computeRelativeImageLink(notePath, imagePath) {
+        const note = this.normalizeVaultPath(notePath);
+        const img = this.normalizeVaultPath(imagePath);
+        const noteDir = note.includes('/') ? note.slice(0, note.lastIndexOf('/')) : '';
+        const fromParts = noteDir ? noteDir.split('/') : [];
+        const toParts = img.split('/');
+        // strip common leading segments
+        let i = 0;
+        while (i < fromParts.length && i < toParts.length - 1 && fromParts[i] === toParts[i]) i++;
+        const ups = fromParts.length - i;
+        const rel = [];
+        for (let u = 0; u < ups; u++) rel.push('..');
+        for (let j = i; j < toParts.length; j++) rel.push(toParts[j]);
+        return rel.join('/');
+    }
+
     getLegacyRepoCandidates(primaryRepo) {
         const normalizedPrimary = (primaryRepo || '').trim();
         const history = Array.isArray(this.settings.repoHistory) ? this.settings.repoHistory : [];
@@ -601,6 +654,15 @@ var MyPlugin = class extends import_obsidian.Plugin {
                 if (view?.file) this.convertNoteLinkFormat(view.file, 'raw');
             }
         });
+        // One-shot: auto-detect repo mode and fix all image links in the note to
+        // the format that actually works (private=v2, public+CDN=cdn, else raw).
+        this.addCommand({
+            id: 'fix-note-links-for-repo-mode',
+            name: 'Fix image links to working format for this repo',
+            editorCallback: (editor, view) => {
+                if (view?.file) this.fixNoteLinksToWorkingFormat(view.file);
+            }
+        });
 
         // Paste handler (baseline behavior)
         this.registerEvent(
@@ -615,6 +677,16 @@ var MyPlugin = class extends import_obsidian.Plugin {
                 if (!imageExtensions.includes(file.extension.toLowerCase())) return;
 
                 const filePathNorm = file.path.replace(/\\\\/g, "/");
+                // Portable local folders (opt-in): never auto-upload anything inside a
+                // designated main folder. Uses the same match rule as note detection
+                // (prefix + "/"), so images in "<mainFolder>/photos/..." are skipped.
+                if (this.settings.portableLocalEnabled && Array.isArray(this.settings.portableLocalList)) {
+                    const inPortable = this.settings.portableLocalList.some((entry) => {
+                        const folder = this.normalizeVaultPath((entry && (entry.path || entry)) || '');
+                        return folder && (filePathNorm === folder || filePathNorm.startsWith(folder + "/"));
+                    });
+                    if (inPortable) return;
+                }
                 const localOnly = (Array.isArray(this.settings.localOnlyList) && this.settings.localOnlyList.length > 0
                     ? this.settings.localOnlyList
                     : (this.settings.localOnlyFolders || this.settings.localImageFolder || 'notepix-local').split(','))
@@ -686,6 +758,10 @@ var MyPlugin = class extends import_obsidian.Plugin {
             clearTimeout(this._fileOpenDebounceTimer);
             this._fileOpenDebounceTimer = null;
         }
+        if (this._tokenResetTimer) {
+            clearTimeout(this._tokenResetTimer);
+            this._tokenResetTimer = null;
+        }
 
         // IMPORTANT: Revoke all created blob URLs to prevent memory leaks
         if (this.imageCache) {
@@ -727,6 +803,19 @@ var MyPlugin = class extends import_obsidian.Plugin {
         }
         const imageFile = Array.from(files).find(file => file.type.startsWith("image/"));
         if (!imageFile) {
+            return;
+        }
+
+        // Portable local folders (opt-in): if the active note is inside a designated
+        // main folder, keep the image LOCAL (never upload). Checked first, returns
+        // before any GitHub/upload logic.
+        const activeViewForPortable = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
+        const portableMain = activeViewForPortable?.file
+            ? this.getPortableMainFolderForNote(activeViewForPortable.file.path)
+            : null;
+        if (portableMain) {
+            evt.preventDefault();
+            await this.saveImagePortable(imageFile, portableMain);
             return;
         }
 
@@ -856,7 +945,50 @@ var MyPlugin = class extends import_obsidian.Plugin {
 
         // Insert the link to the newly created file.
         activeView.editor.replaceSelection(`![[${newFile.path}]]`);
-    }  // New method to get the token, prompting for password if needed (encrypted mode).
+    }
+
+    // --- Portable local folders: save a pasted image locally, never uploaded ---
+    // Stores in "<mainFolder>/<photos>/NoteName-N.ext" and inserts a relative (or
+    // wikilink) link so the whole folder is movable. mainFolder is the normalized
+    // designated folder the active note lives in (from getPortableMainFolderForNote).
+    async saveImagePortable(imageFile, mainFolder) {
+        const activeView = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
+        if (!activeView || !activeView.file) {
+            new import_obsidian.Notice("Cannot save image: No active editor view.");
+            return;
+        }
+        const notePath = this.normalizeVaultPath(activeView.file.path);
+        const sub = this.normalizeVaultPath(this.settings.portablePhotosSubfolder || 'photos') || 'photos';
+        const photosDir = `${mainFolder}/${sub}`;
+        await this.ensureFolderExists(photosDir);
+
+        const noteName = activeView.file.basename || 'Untitled';
+        const extension = (imageFile.name && imageFile.name.split('.').pop()) || 'png';
+
+        // NoteName-1, NoteName-2, ... (collision-safe against what's already there)
+        let i = 1;
+        let newFilePath;
+        do {
+            newFilePath = `${photosDir}/${noteName}-${i}.${extension}`;
+            i++;
+        } while (await this.app.vault.adapter.exists(newFilePath));
+
+        const arrayBuffer = await imageFile.arrayBuffer();
+        const newFile = await this.app.vault.createBinary(newFilePath, arrayBuffer);
+
+        // Insert link per configured format.
+        let linkText;
+        if ((this.settings.portableLinkFormat || 'relative') === 'wikilink') {
+            linkText = `![[${newFile.name}]]`;
+        } else {
+            const rel = this.computeRelativeImageLink(notePath, newFile.path);
+            const encRel = rel.split('/').map(encodeURIComponent).join('/');
+            linkText = `![](${encRel})`;
+        }
+        activeView.editor.replaceSelection(linkText);
+        new import_obsidian.Notice(`Saved locally: ${newFile.name} (not uploaded).`);
+    }
+    // New method to get the token, prompting for password if needed (encrypted mode).
     async getDecryptedToken() {
         if (this.decryptedToken) {
             return this.decryptedToken;
@@ -955,6 +1087,45 @@ var MyPlugin = class extends import_obsidian.Plugin {
 
     clearRepoPrivacyCache() {
         this.repoPrivacyCache = null;
+    }
+
+    // Called when the token is (re)saved. A new/rotated token invalidates every
+    // cached result from the OLD token, so we forget them all and let the current
+    // note re-fetch fresh. Fixes: (T1) new token ignored until restart — the old
+    // in-memory decryptedToken kept winning; (T2) broken images stayed broken —
+    // the negative cache (failedImageFetches) + blob cache were only cleared on
+    // unload. Debounced by the caller so mashing "Save" doesn't thrash.
+    resetTokenAndImageCaches() {
+        // T1: drop the old in-memory token so the new one is used immediately.
+        this.decryptedToken = null;
+        // T2: forget prior successes AND failures (they were tied to the old token).
+        if (this.imageCache) {
+            this.imageCache.forEach((url) => { try { URL.revokeObjectURL(url); } catch (_) {} });
+            this.imageCache.clear();
+        }
+        if (this.failedImageFetches) this.failedImageFetches.clear();
+        if (this.legacyResolvedRepoByKey) this.legacyResolvedRepoByKey.clear();
+        if (this.legacyUnresolvedUntil) this.legacyUnresolvedUntil.clear();
+        this.clearRepoPrivacyCache();
+        this.clearRepoListCache();
+        // Re-render the active note so its images retry with the new token,
+        // without touching the rest of the vault.
+        try {
+            const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
+            if (view && typeof view.previewMode?.rerender === 'function') {
+                view.previewMode.rerender(true);
+            }
+        } catch (_) { /* best-effort refresh */ }
+    }
+
+    // Debounced wrapper: coalesces rapid token saves (e.g. double/triple-clicking
+    // "Save") into a single reset ~1s after the last save.
+    scheduleTokenCacheReset() {
+        if (this._tokenResetTimer) clearTimeout(this._tokenResetTimer);
+        this._tokenResetTimer = setTimeout(() => {
+            this._tokenResetTimer = null;
+            this.resetTokenAndImageCaches();
+        }, 1000);
     }
 
     // Check whether a note contains raw GitHub image URLs owned by the configured user.
@@ -2611,8 +2782,10 @@ var MyPlugin = class extends import_obsidian.Plugin {
             if (e.isWiki) continue;
             const ref = this.canonicalizeImageRef(e.urlRaw);
             if (!ref || ref.ambiguous) continue;
-            // Only raw<->cdn are convertible public formats.
-            if (ref.kind !== 'raw' && ref.kind !== 'cdn') continue;
+            // Convertible managed formats: raw, cdn (public) and v2 (private).
+            // v2 is included so "fix links for repo mode" can normalize a stale
+            // v2 link in a now-public repo to raw/cdn, and raw/cdn to v2 when private.
+            if (ref.kind !== 'raw' && ref.kind !== 'cdn' && ref.kind !== 'v2') continue;
             if (ref.kind === targetFormat) continue; // already in target format
             const encPath = ref.path.split('/').map(encodeURIComponent).join('/');
             let newUrl;
@@ -2620,6 +2793,13 @@ var MyPlugin = class extends import_obsidian.Plugin {
                 newUrl = `https://cdn.jsdelivr.net/gh/${ref.owner}/${ref.repo}@${ref.branch}/${encPath}`;
             } else if (targetFormat === 'raw') {
                 newUrl = `https://raw.githubusercontent.com/${ref.owner}/${ref.repo}/${ref.branch}/${encPath}`;
+            } else if (targetFormat === 'v2') {
+                // Self-describing private link; encode each segment (matches the v2
+                // construction used at upload time in handleImageUpload).
+                const encOwner = encodeURIComponent(ref.owner);
+                const encRepo = encodeURIComponent(ref.repo);
+                const encBranch = encodeURIComponent(ref.branch);
+                newUrl = `obsidian://notepix/v2/${encOwner}/${encRepo}/${encBranch}/${encPath}`;
             } else {
                 continue;
             }
@@ -2667,6 +2847,51 @@ var MyPlugin = class extends import_obsidian.Plugin {
         new import_obsidian.Notice(count > 0
             ? `Converted ${count} image link(s) to ${targetFormat === 'cdn' ? 'jsDelivr CDN' : 'GitHub raw'}.`
             : "No convertible public image links found in this note.");
+    }
+
+    // Decide the correct link format for the CURRENT repo mode, then normalize all
+    // managed image links in the active note to it. One command, no user choice:
+    //   private            -> v2 (only format that renders for private repos)
+    //   public + CDN on    -> jsDelivr CDN
+    //   public + CDN off   -> raw GitHub
+    //   unknown            -> abort (don't guess; token likely locked/unavailable)
+    // Current-note only; atomic write; skips ambiguous legacy links.
+    async fixNoteLinksToWorkingFormat(file) {
+        if (!(file instanceof import_obsidian.TFile) || !file.path.endsWith('.md')) {
+            new import_obsidian.Notice("Open a markdown note first."); return;
+        }
+        const privacy = await this.getRepoPrivacy();
+        if (privacy !== 'private' && privacy !== 'public') {
+            new import_obsidian.Notice("NotePix: Couldn't detect repo mode — unlock your token and try again. No changes made.", 7000);
+            return;
+        }
+        const targetFormat = (privacy === 'private')
+            ? 'v2'
+            : (this.settings.useCdn ? 'cdn' : 'raw');
+
+        let count = 0;
+        try {
+            if (typeof this.app.vault.process === 'function') {
+                await this.app.vault.process(file, (data) => {
+                    const r = this.convertLinkFormatsInText(data, targetFormat);
+                    count = r.converted;
+                    return r.text;
+                });
+            } else {
+                const data = await this.app.vault.read(file);
+                const r = this.convertLinkFormatsInText(data, targetFormat);
+                count = r.converted;
+                if (count > 0) await this.app.vault.modify(file, r.text);
+            }
+        } catch (e) {
+            console.error("NotePix: fix links failed", e);
+            new import_obsidian.Notice("Could not fix image links."); return;
+        }
+        const label = targetFormat === 'v2' ? 'private (v2)'
+            : targetFormat === 'cdn' ? 'jsDelivr CDN' : 'GitHub raw';
+        new import_obsidian.Notice(count > 0
+            ? `Fixed ${count} image link(s) to ${label} format for this repo.`
+            : `No image links needed fixing (already in ${label} format, or none found).`);
     }
 
     // Compute character ranges covered by fenced (``` ```) or indented code
@@ -3247,6 +3472,21 @@ var MyPlugin = class extends import_obsidian.Plugin {
                     }
                     img.src = errorSvg;
                     console.error(`NotePix: Failed to fetch image ${owner}/${repo}/${branch}/${path} from candidate repos.`);
+                    // T3: when the image belongs to the CONFIGURED repo and still fails,
+                    // the token almost certainly can't access that repo (GitHub returns
+                    // 404 for private repos a token can't see). Surface ONE clear,
+                    // throttled notice instead of leaving only cryptic console 404s.
+                    if (owner === cfgUser && repo === cfgRepo) {
+                        const now = Date.now();
+                        if (!this._lastAccessNoticeAt || (now - this._lastAccessNoticeAt) > 30000) {
+                            this._lastAccessNoticeAt = now;
+                            new import_obsidian.Notice(
+                                "NotePix: Couldn't load image(s). Your token may not have access to this repository. " +
+                                "Check the token's repository access and that it has 'Contents' permission (Read).",
+                                9000
+                            );
+                        }
+                    }
                     return;
                 }
 
@@ -3775,6 +4015,77 @@ var GitHubUploaderSettingTab = class extends import_obsidian.PluginSettingTab {
                 await this.plugin.saveSettings();
             }));
 
+        // --- Portable local folders (opt-in). Master toggle; reveals sub-options. ---
+        new import_obsidian.Setting(containerEl)
+            .setName("Portable local folders")
+            .setDesc("Optional. For notes inside the folders you list, pasted images stay LOCAL (never uploaded), are named after the note (MyNote-1.png), stored in a subfolder inside that folder, and linked with a relative path so the whole folder can be moved without breaking images. Great for report folders you export to PDF.")
+            .addToggle((toggle) => toggle.setValue(!!this.plugin.settings.portableLocalEnabled).onChange(async (value) => {
+                this.plugin.settings.portableLocalEnabled = value;
+                await this.plugin.saveSettings();
+                this.display(); // re-render to reveal/hide the sub-options
+            }));
+
+        if (this.plugin.settings.portableLocalEnabled) {
+            // Folder list (comma-separated paths) + a picker to append a vault folder.
+            const toCSV = (list) => (Array.isArray(list) ? list : [])
+                .map(e => (e && (e.path || e)) || '').map(s => String(s).trim()).filter(Boolean).join(', ');
+            const fromCSV = (csv) => String(csv || '').split(',').map(s => s.trim()).filter(Boolean).map(p => ({ path: p }));
+
+            const folderSetting = new import_obsidian.Setting(containerEl)
+                .setName("Portable folders")
+                .setDesc("Comma-separated folder paths. Notes inside these keep their images local. Use the picker to add one, or type paths directly.")
+                .addText((text) => text
+                    .setPlaceholder("OfficeReports, Work/Clients")
+                    .setValue(toCSV(this.plugin.settings.portableLocalList))
+                    .onChange(async (value) => {
+                        this.plugin.settings.portableLocalList = fromCSV(value);
+                        await this.plugin.saveSettings();
+                    }));
+            folderSetting.addExtraButton((btn) => {
+                btn.setIcon?.("folder-open");
+                if (!btn.setIcon) btn.setButtonText("Browse");
+                btn.setTooltip?.("Add a folder from your vault");
+                btn.onClick(() => {
+                    const folders = this.plugin.getVaultFolderPaths();
+                    const modal = new VaultFolderSuggestModal(this.app, folders, async (picked) => {
+                        if (!picked) return;
+                        const list = Array.isArray(this.plugin.settings.portableLocalList) ? this.plugin.settings.portableLocalList.slice() : [];
+                        const norm = this.plugin.normalizeVaultPath(picked);
+                        if (norm && !list.some(e => this.plugin.normalizeVaultPath((e && (e.path || e)) || '') === norm)) {
+                            list.push({ path: norm });
+                            this.plugin.settings.portableLocalList = list;
+                            await this.plugin.saveSettings();
+                            this.display();
+                        }
+                    });
+                    modal.open();
+                });
+            });
+
+            new import_obsidian.Setting(containerEl)
+                .setName("Images subfolder name")
+                .setDesc("Subfolder created inside each portable folder to hold its images.")
+                .addText((text) => text
+                    .setPlaceholder("photos")
+                    .setValue(this.plugin.settings.portablePhotosSubfolder || 'photos')
+                    .onChange(async (value) => {
+                        this.plugin.settings.portablePhotosSubfolder = (value || '').trim() || 'photos';
+                        await this.plugin.saveSettings();
+                    }));
+
+            new import_obsidian.Setting(containerEl)
+                .setName("Link format for portable images")
+                .setDesc("'Relative markdown' works in Obsidian and standard Markdown (best for PDF export). 'Wikilink' is Obsidian-native (resolves by filename) but won't render outside Obsidian.")
+                .addDropdown(dropdown => dropdown
+                    .addOption('relative', 'Relative markdown  ![](photos/img.png)')
+                    .addOption('wikilink', 'Wikilink  ![[img.png]]')
+                    .setValue(this.plugin.settings.portableLinkFormat || 'relative')
+                    .onChange(async (value) => {
+                        this.plugin.settings.portableLinkFormat = value;
+                        await this.plugin.saveSettings();
+                    }));
+        }
+
         new import_obsidian.Setting(containerEl)
             .setName("Pasted image upload behavior")
             .setDesc("Choose whether to upload pasted images automatically or to be asked each time.")
@@ -4247,9 +4558,10 @@ var GitHubUploaderSettingTab = class extends import_obsidian.PluginSettingTab {
                     this.plugin.settings.encryptedToken = encrypted;
                     // Clear plain token for security when switching to encrypted mode
                     this.plugin.settings.plainToken = "";
-                    this.plugin.clearRepoPrivacyCache();
-                    this.plugin.clearRepoListCache();
                     await this.plugin.saveSettings();
+                    // T1+T2: new token → drop old in-memory token + stale image caches
+                    // (debounced so repeated Save clicks coalesce), then refresh note.
+                    this.plugin.scheduleTokenCacheReset();
                     new import_obsidian.Notice("Token has been encrypted and saved!");
                 } catch (e) {
                     new import_obsidian.Notice(`Encryption failed: ${e.message}`);
@@ -4266,9 +4578,10 @@ var GitHubUploaderSettingTab = class extends import_obsidian.PluginSettingTab {
                     text.setValue(this.plugin.settings.plainToken || "");
                     text.onChange(async (value) => {
                         this.plugin.settings.plainToken = value;
-                        this.plugin.clearRepoPrivacyCache();
-                        this.plugin.clearRepoListCache();
                         await this.plugin.saveSettings();
+                        // T1+T2: token changed → drop old in-memory token + stale caches
+                        // (debounced; onChange fires per keystroke, so coalescing matters).
+                        this.plugin.scheduleTokenCacheReset();
                     });
                 });
         }

@@ -1,9 +1,9 @@
 {
 	"id": "notepix",
 	"name": "NotePix",
-	"version": "1.5.0",
+	"version": "1.5.1",
 	"minAppVersion": "0.15.0",
-	"description": "Automatically uploads images to your public or private GitHub repository, replacing local links with the corresponding remote URLs",
+	"description": "Keep your vault lightweight: auto upload pasted screenshots & images to a public or private GitHub repo and replace them with fast hosted links. Encrypted token storage, desktop & mobile.",
 	"author": "AyushParkara",
 	"authorUrl": "https://github.com/AyushParkara",
 	"fundingUrl": "https://www.paypal.com/paypalme/AyushParkara",
